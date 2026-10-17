@@ -4,6 +4,7 @@ import json
 import ctypes
 import platform
 import tkinter as tk
+import tkinter.font as tkfont
 
 # ── Platform detection ─────────────────────────────────────────────────────
 IS_WINDOWS = platform.system() == "Windows"
@@ -191,15 +192,48 @@ FG_DIM = "#aaaaaa"
 FG_GOLD = "#f1c40f"
 FG_SEPARATOR = "#2a3b4c"
 
-FONT_TITLE = ("Playfair Display SC", 16, "bold")
-FONT_DESC = ("Marcellus", 11, "italic")
-FONT_HEADER = ("Playfair Display SC", 13, "bold")
-FONT_BODY = ("Marcellus", 13)
-FONT_UI_BOLD = ("Marcellus", 14, "bold")
-FONT_TAB_BOLD = ("Marcellus", 13, "bold")
-FONT_BOLD_SMALL = ("Marcellus", 11, "bold")
-FONT_SMALL = ("Marcellus", 11)
-FONT_XSMALL = ("Marcellus", 10)
+_FONT_SPECS = {
+    "FONT_TITLE": ("Playfair Display SC", 16, "bold"),
+    "FONT_DESC": ("Marcellus", 11, "italic"),
+    "FONT_HEADER": ("Playfair Display SC", 13, "bold"),
+    "FONT_BODY": ("Marcellus", 13),
+    "FONT_UI_BOLD": ("Marcellus", 14, "bold"),
+    "FONT_TAB_BOLD": ("Marcellus", 13, "bold"),
+    "FONT_BOLD_SMALL": ("Marcellus", 11, "bold"),
+    "FONT_SMALL": ("Marcellus", 11),
+    "FONT_XSMALL": ("Marcellus", 10),
+    "FONT_XSMALL_BOLD": ("Marcellus", 10, "bold"),
+    "FONT_LOG": ("Consolas", 10),
+    "FONT_CODE": ("Courier New", 20, "bold"),
+}
+globals().update(_FONT_SPECS)
+_ui_fonts = {}
+_default_font_families = {}
+
+
+def _init_ui_fonts(root):
+    """Keep named fonts alive so existing widgets, text tags and Canvas items update together."""
+    for name, spec in _FONT_SPECS.items():
+        _ui_fonts[name] = tkfont.Font(root=root, font=spec)
+    globals().update(_ui_fonts)
+    # TkTextFont covers ttk Combobox popdowns; TkMenuFont covers native menus.
+    for name in tkfont.names(root):
+        if name.startswith("Tk"):
+            _default_font_families[name] = tkfont.nametofont(name, root=root).actual("family")
+
+
+def _set_language_fonts(language):
+    chinese = language in ("simplified_chinese", "traditional_chinese")
+    for name, font in _ui_fonts.items():
+        spec = _FONT_SPECS[name]
+        font.configure(
+            family="Microsoft YaHei UI" if chinese else spec[0],
+            slant="italic" if not chinese and "italic" in spec[2:] else "roman",
+        )
+    # Also cover widgets and native menus without an explicit font; restore their
+    # original system families when switching away from Chinese.
+    for name, family in _default_font_families.items():
+        tkfont.nametofont(name).configure(family="Microsoft YaHei UI" if chinese else family)
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -429,6 +463,7 @@ def _init_loca(override_lang: str = None):
     _loca_strings = _load_loca(lang)
     if not _loca_strings:
         _loca_strings = _load_loca('english')
+    _set_language_fonts(lang)
 
 def T(line_id: int, *args) -> str:
     """Return localised string, optionally formatting with positional {0} args."""
@@ -440,7 +475,7 @@ def T(line_id: int, *args) -> str:
             return s
     return s
 
-# _init_loca() is called inside AnnoModManagerApp.__init__ after language selection
+# _init_loca() is called after settings load and whenever the language changes.
 
 # --- Mod.io integration ---
 MODIO_GAME_ID = "11358"
@@ -477,6 +512,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
     def __init__(self):
         """Initialises the main application window, sets up all state variables, loads settings and metadata, builds the UI and schedules the language-picker / first-run sequence."""
         super().__init__()
+        _init_ui_fonts(self)
         self.title("Anno 117 Mod Manager" + f' v{_version.__VERSION__}')
         try:
             if IS_WINDOWS:
@@ -551,6 +587,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         self.modio_terms_agreed = False
         self.modio_token_expires = 0  # Unix timestamp from API
         self.load_settings()
+        _init_loca(self.settings.get(_LANGUAGE_SETTINGS_KEY))
         self.modio_api_key = self.settings.get("modio_api_key", "")
         self.use_mod_browser = self.settings.get("use_mod_browser", None)
         self.modio_declined = self.settings.get("modio_declined", False)
@@ -1720,14 +1757,14 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                 self.discord_border.pack(fill="x", padx=10, pady=(5, 2))
 
                 discord_ico = load_icon("discord", (24, 24))
-                self.discord_btn = tk.Button(self.discord_border, text="  Mod Corner\nDiscord", command=open_discord, image=discord_ico, compound="left", bg="#5865F2", fg="white", font=("Marcellus", 10, "bold"), relief="flat", bd=0, cursor="hand2", pady=8)
+                self.discord_btn = tk.Button(self.discord_border, text="  Mod Corner\nDiscord", command=open_discord, image=discord_ico, compound="left", bg="#5865F2", fg="white", font=FONT_XSMALL_BOLD, relief="flat", bd=0, cursor="hand2", pady=8)
                 self.discord_btn.pack(fill="both", expand=True)
                 self._bind_border_button_hover(self.discord_btn, "#5865F2", "#6c75f3")
 
                 docu_ico = load_icon("docu", (24, 24))
                 self.docs_border = tk.Frame(self.sidebar, bg="#4c565f", highlightthickness=1, highlightbackground="#4c565f", bd=0)
                 self.docs_border.pack(fill="x", padx=10, pady=(2, 2))
-                self.docs_btn = tk.Button(self.docs_border, text="  Github\n  Readme", command=open_docs, image=docu_ico, compound="left", bg="#4c565f", fg="white", font=("Marcellus", 10, "bold"), relief="flat", bd=0, cursor="hand2", pady=8)
+                self.docs_btn = tk.Button(self.docs_border, text="  Github\n  Readme", command=open_docs, image=docu_ico, compound="left", bg="#4c565f", fg="white", font=FONT_XSMALL_BOLD, relief="flat", bd=0, cursor="hand2", pady=8)
                 self.docs_btn.pack(fill="both", expand=True)
                 self._bind_border_button_hover(self.docs_btn, "#4c565f", "#65717c")
 
@@ -1737,7 +1774,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                 kofi_ico = load_icon("kofi", (24, 24))
                 self.kofi_border = tk.Frame(self.sidebar, bg="#5F032E", highlightthickness=1, highlightbackground="#5F032E", bd=0)
                 self.kofi_border.pack(fill="x", padx=10, pady=(5, 5))
-                self.kofi_btn = tk.Button(self.kofi_border, text=" Support me on Ko-fi!", command=open_kofi, image=kofi_ico, compound="left", bg="#5F032E", fg="white", font=("Marcellus", 10, "bold"), relief="flat", bd=0, cursor="hand2", pady=8)
+                self.kofi_btn = tk.Button(self.kofi_border, text=" Support me on Ko-fi!", command=open_kofi, image=kofi_ico, compound="left", bg="#5F032E", fg="white", font=FONT_XSMALL_BOLD, relief="flat", bd=0, cursor="hand2", pady=8)
                 self.kofi_btn.pack(fill="both", expand=True)
                 self._bind_border_button_hover(self.kofi_btn, "#5F032E", "#82043f")
 
@@ -3877,7 +3914,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         scrollbar = ttk.Scrollbar(log_container)
         scrollbar.pack(side="right", fill="y")
 
-        self.log_text_area = tk.Text(log_container, bg="#050c17", fg=FG_MAIN, font=("Consolas", 10), yscrollcommand=scrollbar.set, wrap="word", state="normal")
+        self.log_text_area = tk.Text(log_container, bg="#050c17", fg=FG_MAIN, font=FONT_LOG, yscrollcommand=scrollbar.set, wrap="word", state="normal")
         self.log_text_area.pack(side="left", fill="both", expand=True)
         scrollbar.config(command=self.log_text_area.yview)
 
@@ -4970,7 +5007,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         scrollbar = tk.Scrollbar(container, orient="vertical")
         scrollbar.pack(side="right", fill="y")
 
-        txt_area = tk.Text(container, wrap=tk.WORD, bg=BG_MAIN, fg=FG_MAIN, font=("Marcellus", 11), padx=20, pady=20, relief="flat", yscrollcommand=scrollbar.set)
+        txt_area = tk.Text(container, wrap=tk.WORD, bg=BG_MAIN, fg=FG_MAIN, font=FONT_SMALL, padx=20, pady=20, relief="flat", yscrollcommand=scrollbar.set)
         txt_area.pack(side="left", expand=True, fill="both")
         scrollbar.config(command=txt_area.yview)
 
@@ -5093,7 +5130,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
 
             code_var = tk.StringVar()
             # Style the code entry specifically (larger letters/spacing)
-            entry = tk.Entry(code_win, textvariable=code_var, font=("Courier New", 20, "bold"), bg=BG_SECTION, fg="#2ecc71", insertbackground=FG_MAIN, relief="flat", width=10, justify="center")
+            entry = tk.Entry(code_win, textvariable=code_var, font=FONT_CODE, bg=BG_SECTION, fg="#2ecc71", insertbackground=FG_MAIN, relief="flat", width=10, justify="center")
             entry.pack(pady=10, ipady=5)
             entry.focus_set()
 
