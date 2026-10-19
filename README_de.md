@@ -40,6 +40,7 @@ Eine Desktop-Anwendung zur Verwaltung von Mods für **Anno 117: Pax Romana**. Si
     - [Manuelle Installation-Tab](#manuelle-installation-tab)
     - [Modloader-Log-Tab](#modloader-log-tab)
     - [Tweaking-Tab](#tweaking-tab)
+      - [Für Mod-Autoren: Optionen gruppieren](#für-mod-autoren-optionen-gruppieren)
     - [Einstellungen-Tab](#einstellungen-tab)
       - [Allgemein](#allgemein)
       - [Spieldateien](#spieldateien)
@@ -303,8 +304,91 @@ Einige Mods legen in ihrer `modinfo.json` konfigurierbare Wertoptionen fest (Zah
   - **Schieberegler** – Bewegt den Schieberegler frei in festgelegten Schritten auf einen beliebigen Wert zwischen dem Minimal- und dem Maximalwert.
   - **Text / Farbe** – Freitexteingabe; Farboptionen enthalten eine Farbauswahl-Schaltfläche für bestimmte Mods.
 - Änderungen werden in `active-options.jsonc` in deinem Mod-Ordner gespeichert und beim nächsten Spielstart angewendet.
-- **Optionsgruppen** – Mod-Autoren können zusammengehörige Optionen in aufklappbare Abschnitte bündeln: Ein Eintrag mit `"type": "group"` (plus `label` und optional `"collapsed": true`) wird zur Abschnittsüberschrift, und jede Option mit `"group": "<Gruppenschlüssel>"` erscheint darin. Ein Klick auf die Überschrift klappt den Abschnitt auf oder zu. Gruppen dienen nur der Anzeige und werden nie in `active-options.jsonc` geschrieben.
+- **Optionsgruppen** – Mod-Autoren können zusammengehörige Optionen in aufklappbare Abschnitte bündeln: Ein Eintrag mit `"type": "group"` (plus `label` und optional `"collapsed": true`) wird zur Abschnittsüberschrift, und jede Option mit `"group": "<Gruppenschlüssel>"` erscheint darin. Ein Klick auf die Überschrift klappt den Abschnitt auf oder zu. Gruppen dienen nur der Anzeige und werden nie in `active-options.jsonc` geschrieben. Ein Beispiel findest du unter [Für Mod-Autoren: Optionen gruppieren](#für-mod-autoren-optionen-gruppieren).
 - **Auf Standard zurücksetzen** setzt die Optionen für den ausgewählten Mod zurück. **Alle auf Standard zurücksetzen** setzt jeden Mod auf einmal zurück.
+
+#### Für Mod-Autoren: Optionen gruppieren
+
+Optionen stehen im `Options`-Block deiner `modinfo.json`. Zum Gruppieren legst du pro Gruppe einen Eintrag an und verweist in jeder Option darauf:
+
+| Schlüssel | Wo | Bedeutung |
+|---|---|---|
+| `"type": "group"` | Gruppeneintrag | Macht den Eintrag zur Abschnittsüberschrift statt zu einer Option. |
+| `"label"` | Gruppeneintrag | Text der Überschrift. Fehlt er, wird der Schlüssel der Gruppe angezeigt. |
+| `"collapsed"` | Gruppeneintrag | `true` zeigt den Abschnitt anfangs zugeklappt. Standard: `false` (aufgeklappt). |
+| `"group"` | Option | Schlüssel der Gruppe, zu der die Option gehört. |
+
+Beispiel:
+
+```json
+"Options": {
+  "economy": {
+    "type": "group",
+    "label": "Economy"
+  },
+  "visuals": {
+    "type": "group",
+    "label": "Visuals",
+    "collapsed": true
+  },
+  "marketRadius": {
+    "group": "economy",
+    "label": "Market radius multiplier",
+    "type": "slider",
+    "default": "1.5",
+    "values": ["0.5", "3", "0.1"],
+    "labels": ["Multiplies the market's influence radius (vanilla: 1)"]
+  },
+  "tradeMode": {
+    "group": "economy",
+    "label": "Trade mode",
+    "type": "enum",
+    "default": "balanced",
+    "values": ["cheap", "balanced", "expensive"],
+    "labels": ["Goods are 25% cheaper", "Vanilla prices", "Goods are 25% more expensive"]
+  },
+  "showStalls": {
+    "group": "visuals",
+    "label": "Show market stalls",
+    "type": "toggle",
+    "default": "true",
+    "labels": ["Stalls are visible around the market", "Market square stays empty"]
+  },
+  "awningColour": {
+    "group": "visuals",
+    "label": "Awning colour",
+    "type": "text",
+    "default": "-3381760",
+    "labels": ["Signed ARGB integer, or use the colour picker"]
+  },
+  "debugLog": {
+    "label": "Write debug log",
+    "type": "toggle",
+    "default": "false",
+    "labels": ["Extra entries are written to mod-loader.log", "No extra log output"]
+  }
+}
+```
+
+Wird der Mod ausgewählt, ist *Economy* aufgeklappt und *Visuals* wegen `"collapsed": true` zugeklappt. `debugLog` hat kein `group` und steht deshalb einzeln unter den Gruppen:
+
+<img src="docs/images/tweaking-groups-default.png" alt="Economy aufgeklappt, Visuals zugeklappt, ungruppierte Option darunter" width="420">
+
+Ein Klick auf die Überschrift *Visuals* klappt sie auf:
+
+<img src="docs/images/tweaking-groups-expanded.png" alt="Beide Gruppen aufgeklappt" width="420">
+
+Sind beide Gruppen zugeklappt, bleiben nur die Überschriften und die ungruppierte Option sichtbar:
+
+<img src="docs/images/tweaking-groups-collapsed.png" alt="Beide Gruppen zugeklappt" width="420">
+
+Hinweise:
+
+- Gruppen erscheinen in der Reihenfolge, in der sie in `Options` stehen, und immer **über** den ungruppierten Optionen. Optionen innerhalb einer Gruppe behalten ihre Reihenfolge.
+- `collapsed` legt nur den Anfangszustand fest. Wird der Mod erneut ausgewählt, gilt wieder dieser Zustand.
+- Verweist `group` auf einen Schlüssel, der kein Gruppeneintrag ist, wird die Option ungruppiert angezeigt.
+- Gruppeneinträge sind keine Optionen. Sie haben keinen Wert und werden nie in `active-options.jsonc` geschrieben.
+- Gruppen-Labels sind einfache Texte. Anders als `ModName` werden sie nicht je Sprache übersetzt.
 
 ---
 
