@@ -45,6 +45,7 @@ Eine Desktop-Anwendung zur Verwaltung von Mods für **Anno 117: Pax Romana**. Si
       - [Spieldateien](#spieldateien)
       - [Mod-Speicherort](#mod-speicherort)
       - [mod.io-Integration](#modio-integration)
+      - [Unterdrückte Update-Prüfungen](#unterdrückte-update-prüfungen)
       - [Fußzeile](#fußzeile)
   - [Mod-Speicherorte](#mod-speicherorte)
   - [Presets](#presets-1)
@@ -126,7 +127,7 @@ Die linke Seitenleiste ist immer sichtbar und enthält:
 - **Discord** – öffnet den Community-Discord-Server.
 - **Ko-fi** – öffnet die Ko-fi-Seite des Entwicklers, wenn du die Entwicklung unterstützen möchtest.
 - **Dokumentation** – öffnet diese Github-Readme mit Informationen zu den Funktionen der App.
-- **SPIEL STARTEN** – speichert den aktuellen Mod-Status und startet Anno 117 direkt. Vor dem Start prüft die App, ob erforderliche Abhängigkeiten fehlen, und warnt dich, wenn aktive Mods ungelöste Inkompatibilitäten aufweisen.
+- **SPIEL STARTEN** – speichert den aktuellen Mod-Status und startet Anno 117 über Ubisoft Connect oder Steam, sodass dort hinterlegte Startparameter (z. B. `/pipe` für Drittanbieter-Tools) übernommen werden. Lässt sich die Installation keinem der beiden Launcher zuordnen, wird die Spiel-exe direkt gestartet. Vor dem Start prüft die App, ob erforderliche Abhängigkeiten fehlen, und warnt dich, wenn aktive Mods ungelöste Inkompatibilitäten aufweisen.
 
 ---
 
@@ -302,6 +303,7 @@ Einige Mods legen in ihrer `modinfo.json` konfigurierbare Wertoptionen fest (Zah
   - **Schieberegler** – Bewegt den Schieberegler frei in festgelegten Schritten auf einen beliebigen Wert zwischen dem Minimal- und dem Maximalwert.
   - **Text / Farbe** – Freitexteingabe; Farboptionen enthalten eine Farbauswahl-Schaltfläche für bestimmte Mods.
 - Änderungen werden in `active-options.jsonc` in deinem Mod-Ordner gespeichert und beim nächsten Spielstart angewendet.
+- **Optionsgruppen** – Mod-Autoren können zusammengehörige Optionen in aufklappbare Abschnitte bündeln: Ein Eintrag mit `"type": "group"` (plus `label` und optional `"collapsed": true`) wird zur Abschnittsüberschrift, und jede Option mit `"group": "<Gruppenschlüssel>"` erscheint darin. Ein Klick auf die Überschrift klappt den Abschnitt auf oder zu. Gruppen dienen nur der Anzeige und werden nie in `active-options.jsonc` geschrieben.
 - **Auf Standard zurücksetzen** setzt die Optionen für den ausgewählten Mod zurück. **Alle auf Standard zurücksetzen** setzt jeden Mod auf einmal zurück.
 
 ---
@@ -372,6 +374,7 @@ Dort gespeicherte Dateien:
 | `subscriptions.json` | mod.io-Abonnementliste |
 | `subscription_map.json` | Ordnet lokale Mod-IDs mod.io-IDs zu |
 | `collection_follows.json` | Gefolgte Kollektionen |
+| `reddit_cache.json` | Zuletzt geladene r/anno-Beiträge, die genutzt werden, wenn Reddit den Feed drosselt |
 | `debug.log` | Fortlaufendes Debug-Log (max. 2 MB, automatisch als `.bak` archiviert) |
 
 ---
@@ -398,12 +401,13 @@ Wenn du einer Sammlung folgst, wird automatisch ein Preset namens `<Sammlungsnam
 
 ## Ladereihenfolge
 
-Die Ladereihenfolge bestimmt die Reihenfolge, in der das Spiel Mod-Patches anwendet. Die App berechnet sie aus `LoadAfter`-Einträgen in der `modinfo.json` jedes Mods mithilfe einer zweiphasigen topologischen Sortierung:
+Die Ladereihenfolge bestimmt die Reihenfolge, in der das Spiel Mod-Patches anwendet. Die App berechnet sie genauso wie der Mod Loader:
 
-1. **Normale Phase** – Mods ohne Wildcard `*` in `LoadAfter`, sortiert nach Kategorie und dann Name.
-2. **Späte Phase** – Mods mit `LoadAfter: ["*"]`, die nach allen normalen Mods geladen werden.
+1. **Normale Phase, dann späte Phase** – Mods mit `"*"` in `LoadAfter` laden nach allen anderen. `LoadAfter`-Einträge gelten nur innerhalb derselben Phase; nicht installierte Mods werden übersprungen.
+2. **Sub-Mods zuerst** – innerhalb einer Phase werden Sub-Mods (Ordner mit eigener `modinfo.json` innerhalb eines Mods) vor den Hauptmods verarbeitet. Jede Gruppe wird alphabetisch nach `[Kategorie] ModName` sortiert, anhand der englischen Texte.
+3. **Abhängigkeiten zuerst** – bevor ein Mod lädt, werden die Mods aus seinem `LoadAfter` geladen, in der dort angegebenen Reihenfolge.
 
-Aktiviere die **Ladereihenfolge**-Ansicht im Aktivierungs-Tab-Header, um die berechnete Reihenfolge zu sehen. Das Positions-Badge `#` zeigt den endgültigen Index jedes Mods.
+Sub-Mods werden einzeln sortiert, daher können sich Sub-Mods verschiedener Mods abwechseln, und ein Hauptmod selbst lädt meist erst nach allen Sub-Mods. Aktiviere die **Ladereihenfolge**-Ansicht im Aktivierungs-Tab-Header, um die Reihenfolge zu sehen: Jeder Mod und Sub-Mod erhält eine eigene Zeile, durchnummeriert ab 1 in Ladereihenfolge, und Sub-Mod-Zeilen zeigen an, zu welchem Mod sie gehören.
 
 ---
 

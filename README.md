@@ -48,6 +48,7 @@ A desktop application for managing mods for **Anno 117: Pax Romana**. It covers 
       - [Game Files](#game-files)
       - [Mod Storage](#mod-storage)
       - [mod.io Integration](#modio-integration)
+      - [Suppressed Update Checks](#suppressed-update-checks)
       - [Footer](#footer)
   - [Mod Storage Locations](#mod-storage-locations)
   - [Presets](#presets-1)
@@ -129,7 +130,7 @@ The left sidebar is always visible and contains:
 - **Discord** - opens the community Discord server.
 - **Ko-fi** - opens the developer's Ko-fi page if you want to support development.
 - **Documentation** - opens this Github readme for information about the features of the app.
-- **LAUNCH GAME** - saves the current mod state and launches Anno 117 directly. Before launching, the app checks for missing required dependencies and warns you if any active mods have unresolved incompatibilities.
+- **LAUNCH GAME** - saves the current mod state and launches Anno 117 through Ubisoft Connect or Steam, so any launch arguments you set there (e.g. `/pipe` for third-party tools) are applied. If the install can't be matched to either launcher, the game exe is started directly. Before launching, the app checks for missing required dependencies and warns you if any active mods have unresolved incompatibilities.
 
 ---
 
@@ -305,6 +306,7 @@ Some mods expose configurable value options in their `modinfo.json` (colour valu
   - **Slider** - move the slider button in incremental steps to any value inside the min and max value.
   - **Text / Colour** - free-text entry; colour options include a colour-picker button for specific mods.
 - Changes are saved to `active-options.jsonc` in your mod folder and applied next time you launch the game.
+- **Option groups** - mod authors can bundle related options into collapsible sections: an entry with `"type": "group"` (plus a `label` and an optional `"collapsed": true`) becomes a section header, and any option with `"group": "<group key>"` is shown inside it. Click a header to expand or collapse it. Groups are display-only and are never written to `active-options.jsonc`.
 - **Reset to Default** resets options for the selected mod. **Reset All to Default** resets every mod at once.
 
 ---
@@ -375,6 +377,7 @@ Files stored there:
 | `subscriptions.json` | mod.io subscription list |
 | `subscription_map.json` | Maps local mod IDs to mod.io IDs |
 | `collection_follows.json` | Followed collections |
+| `reddit_cache.json` | Last fetched r/anno posts, reused when Reddit rate-limits the feed |
 | `debug.log` | Rolling debug log (max 2 MB, auto-archived to `.bak`) |
 
 ---
@@ -401,12 +404,13 @@ When you follow a collection a preset named `<Collection Name> (Collection)` is 
 
 ## Load Order
 
-The load order determines the sequence in which the game applies mod patches. The app computes it from `LoadAfter` entries in each mod's `modinfo.json` using a two-phase topological sort:
+The load order determines the sequence in which the game applies mod patches. The app calculates it the same way the mod loader does:
 
-1. **Normal phase** - mods without a wildcard `*` in `LoadAfter`, sorted by category then name.
-2. **Late phase** - mods with `LoadAfter: ["*"]`, loaded after all normal mods.
+1. **Normal phase, then late phase** - mods with `"*"` in `LoadAfter` load after all others. `LoadAfter` entries only count within the same phase; mods that aren't installed are skipped.
+2. **Sub-mods first** - within a phase, sub-mods (folders with their own `modinfo.json` inside a mod) are processed before top-level mods. Each group is sorted alphabetically by `[Category] ModName` using the English texts.
+3. **Dependencies before dependents** - before a mod loads, the mods in its `LoadAfter` load first, in the order they are listed.
 
-Enable **Load Order** view in the Activation tab header to see the computed sequence. The position badge `#` shows each mod's final index.
+Sub-mods are sorted individually, so sub-mods of different mods can interleave, and a top-level mod itself usually loads after all sub-mods. Enable the **Load Order** view in the Activation tab header to see the sequence: every mod and sub-mod gets its own row, numbered from 1 in load order, and sub-mod rows show which mod they belong to.
 
 ---
 
