@@ -40,11 +40,13 @@ Eine Desktop-Anwendung zur Verwaltung von Mods für **Anno 117: Pax Romana**. Si
     - [Manuelle Installation-Tab](#manuelle-installation-tab)
     - [Modloader-Log-Tab](#modloader-log-tab)
     - [Tweaking-Tab](#tweaking-tab)
+      - [Für Mod-Autoren: Optionen gruppieren](#für-mod-autoren-optionen-gruppieren)
     - [Einstellungen-Tab](#einstellungen-tab)
       - [Allgemein](#allgemein)
       - [Spieldateien](#spieldateien)
       - [Mod-Speicherort](#mod-speicherort)
       - [mod.io-Integration](#modio-integration)
+      - [Unterdrückte Update-Prüfungen](#unterdrückte-update-prüfungen)
       - [Fußzeile](#fußzeile)
   - [Mod-Speicherorte](#mod-speicherorte)
   - [Presets](#presets-1)
@@ -126,7 +128,7 @@ Die linke Seitenleiste ist immer sichtbar und enthält:
 - **Discord** – öffnet den Community-Discord-Server.
 - **Ko-fi** – öffnet die Ko-fi-Seite des Entwicklers, wenn du die Entwicklung unterstützen möchtest.
 - **Dokumentation** – öffnet diese Github-Readme mit Informationen zu den Funktionen der App.
-- **SPIEL STARTEN** – speichert den aktuellen Mod-Status und startet Anno 117 direkt. Vor dem Start prüft die App, ob erforderliche Abhängigkeiten fehlen, und warnt dich, wenn aktive Mods ungelöste Inkompatibilitäten aufweisen.
+- **SPIEL STARTEN** – speichert den aktuellen Mod-Status und startet Anno 117 über Ubisoft Connect oder Steam, sodass dort hinterlegte Startparameter (z. B. `/pipe` für Drittanbieter-Tools) übernommen werden. Lässt sich die Installation keinem der beiden Launcher zuordnen, wird die Spiel-exe direkt gestartet. Vor dem Start prüft die App, ob erforderliche Abhängigkeiten fehlen, und warnt dich, wenn aktive Mods ungelöste Inkompatibilitäten aufweisen.
 
 ---
 
@@ -302,7 +304,91 @@ Einige Mods legen in ihrer `modinfo.json` konfigurierbare Wertoptionen fest (Zah
   - **Schieberegler** – Bewegt den Schieberegler frei in festgelegten Schritten auf einen beliebigen Wert zwischen dem Minimal- und dem Maximalwert.
   - **Text / Farbe** – Freitexteingabe; Farboptionen enthalten eine Farbauswahl-Schaltfläche für bestimmte Mods.
 - Änderungen werden in `active-options.jsonc` in deinem Mod-Ordner gespeichert und beim nächsten Spielstart angewendet.
+- **Optionsgruppen** – Mod-Autoren können zusammengehörige Optionen in aufklappbare Abschnitte bündeln: Ein Eintrag mit `"type": "group"` (plus `label` und optional `"collapsed": true`) wird zur Abschnittsüberschrift, und jede Option mit `"group": "<Gruppenschlüssel>"` erscheint darin. Ein Klick auf die Überschrift klappt den Abschnitt auf oder zu. Gruppen dienen nur der Anzeige und werden nie in `active-options.jsonc` geschrieben. Ein Beispiel findest du unter [Für Mod-Autoren: Optionen gruppieren](#für-mod-autoren-optionen-gruppieren).
 - **Auf Standard zurücksetzen** setzt die Optionen für den ausgewählten Mod zurück. **Alle auf Standard zurücksetzen** setzt jeden Mod auf einmal zurück.
+
+#### Für Mod-Autoren: Optionen gruppieren
+
+Optionen stehen im `Options`-Block deiner `modinfo.json`. Zum Gruppieren legst du pro Gruppe einen Eintrag an und verweist in jeder Option darauf:
+
+| Schlüssel | Wo | Bedeutung |
+|---|---|---|
+| `"type": "group"` | Gruppeneintrag | Macht den Eintrag zur Abschnittsüberschrift statt zu einer Option. |
+| `"label"` | Gruppeneintrag | Text der Überschrift. Fehlt er, wird der Schlüssel der Gruppe angezeigt. |
+| `"collapsed"` | Gruppeneintrag | `true` zeigt den Abschnitt anfangs zugeklappt. Standard: `false` (aufgeklappt). |
+| `"group"` | Option | Schlüssel der Gruppe, zu der die Option gehört. |
+
+Beispiel:
+
+```json
+"Options": {
+  "economy": {
+    "type": "group",
+    "label": "Economy"
+  },
+  "visuals": {
+    "type": "group",
+    "label": "Visuals",
+    "collapsed": true
+  },
+  "marketRadius": {
+    "group": "economy",
+    "label": "Market radius multiplier",
+    "type": "slider",
+    "default": "1.5",
+    "values": ["0.5", "3", "0.1"],
+    "labels": ["Multiplies the market's influence radius (vanilla: 1)"]
+  },
+  "tradeMode": {
+    "group": "economy",
+    "label": "Trade mode",
+    "type": "enum",
+    "default": "balanced",
+    "values": ["cheap", "balanced", "expensive"],
+    "labels": ["Goods are 25% cheaper", "Vanilla prices", "Goods are 25% more expensive"]
+  },
+  "showStalls": {
+    "group": "visuals",
+    "label": "Show market stalls",
+    "type": "toggle",
+    "default": "true",
+    "labels": ["Stalls are visible around the market", "Market square stays empty"]
+  },
+  "awningColour": {
+    "group": "visuals",
+    "label": "Awning colour",
+    "type": "text",
+    "default": "-3381760",
+    "labels": ["Signed ARGB integer, or use the colour picker"]
+  },
+  "debugLog": {
+    "label": "Write debug log",
+    "type": "toggle",
+    "default": "false",
+    "labels": ["Extra entries are written to mod-loader.log", "No extra log output"]
+  }
+}
+```
+
+Wird der Mod ausgewählt, ist *Economy* aufgeklappt und *Visuals* wegen `"collapsed": true` zugeklappt. `debugLog` hat kein `group` und steht deshalb einzeln unter den Gruppen:
+
+<img src="docs/images/tweaking-groups-default.png" alt="Economy aufgeklappt, Visuals zugeklappt, ungruppierte Option darunter" width="420">
+
+Ein Klick auf die Überschrift *Visuals* klappt sie auf:
+
+<img src="docs/images/tweaking-groups-expanded.png" alt="Beide Gruppen aufgeklappt" width="420">
+
+Sind beide Gruppen zugeklappt, bleiben nur die Überschriften und die ungruppierte Option sichtbar:
+
+<img src="docs/images/tweaking-groups-collapsed.png" alt="Beide Gruppen zugeklappt" width="420">
+
+Hinweise:
+
+- Gruppen erscheinen in der Reihenfolge, in der sie in `Options` stehen, und immer **über** den ungruppierten Optionen. Optionen innerhalb einer Gruppe behalten ihre Reihenfolge.
+- `collapsed` legt nur den Anfangszustand fest. Wird der Mod erneut ausgewählt, gilt wieder dieser Zustand.
+- Verweist `group` auf einen Schlüssel, der kein Gruppeneintrag ist, wird die Option ungruppiert angezeigt.
+- Gruppeneinträge sind keine Optionen. Sie haben keinen Wert und werden nie in `active-options.jsonc` geschrieben.
+- Gruppen-Labels sind einfache Texte. Anders als `ModName` werden sie nicht je Sprache übersetzt.
 
 ---
 
@@ -372,6 +458,7 @@ Dort gespeicherte Dateien:
 | `subscriptions.json` | mod.io-Abonnementliste |
 | `subscription_map.json` | Ordnet lokale Mod-IDs mod.io-IDs zu |
 | `collection_follows.json` | Gefolgte Kollektionen |
+| `reddit_cache.json` | Zuletzt geladene r/anno-Beiträge, die genutzt werden, wenn Reddit den Feed drosselt |
 | `debug.log` | Fortlaufendes Debug-Log (max. 2 MB, automatisch als `.bak` archiviert) |
 
 ---
@@ -398,12 +485,13 @@ Wenn du einer Sammlung folgst, wird automatisch ein Preset namens `<Sammlungsnam
 
 ## Ladereihenfolge
 
-Die Ladereihenfolge bestimmt die Reihenfolge, in der das Spiel Mod-Patches anwendet. Die App berechnet sie aus `LoadAfter`-Einträgen in der `modinfo.json` jedes Mods mithilfe einer zweiphasigen topologischen Sortierung:
+Die Ladereihenfolge bestimmt die Reihenfolge, in der das Spiel Mod-Patches anwendet. Die App berechnet sie genauso wie der Mod Loader:
 
-1. **Normale Phase** – Mods ohne Wildcard `*` in `LoadAfter`, sortiert nach Kategorie und dann Name.
-2. **Späte Phase** – Mods mit `LoadAfter: ["*"]`, die nach allen normalen Mods geladen werden.
+1. **Normale Phase, dann späte Phase** – Mods mit `"*"` in `LoadAfter` laden nach allen anderen. `LoadAfter`-Einträge gelten nur innerhalb derselben Phase; nicht installierte Mods werden übersprungen.
+2. **Sub-Mods zuerst** – innerhalb einer Phase werden Sub-Mods (Ordner mit eigener `modinfo.json` innerhalb eines Mods) vor den Hauptmods verarbeitet. Jede Gruppe wird alphabetisch nach `[Kategorie] ModName` sortiert, anhand der englischen Texte.
+3. **Abhängigkeiten zuerst** – bevor ein Mod lädt, werden die Mods aus seinem `LoadAfter` geladen, in der dort angegebenen Reihenfolge.
 
-Aktiviere die **Ladereihenfolge**-Ansicht im Aktivierungs-Tab-Header, um die berechnete Reihenfolge zu sehen. Das Positions-Badge `#` zeigt den endgültigen Index jedes Mods.
+Sub-Mods werden einzeln sortiert, daher können sich Sub-Mods verschiedener Mods abwechseln, und ein Hauptmod selbst lädt meist erst nach allen Sub-Mods. Aktiviere die **Ladereihenfolge**-Ansicht im Aktivierungs-Tab-Header, um die Reihenfolge zu sehen: Jeder Mod und Sub-Mod erhält eine eigene Zeile, durchnummeriert ab 1 in Ladereihenfolge, und Sub-Mod-Zeilen zeigen an, zu welchem Mod sie gehören.
 
 ---
 

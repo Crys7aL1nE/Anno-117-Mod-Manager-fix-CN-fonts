@@ -43,11 +43,13 @@ A desktop application for managing mods for **Anno 117: Pax Romana**. It covers 
     - [Manual Install Tab](#manual-install-tab)
     - [Modloader Log Tab](#modloader-log-tab)
     - [Tweaking Tab](#tweaking-tab)
+      - [For Mod Authors: Grouping Options](#for-mod-authors-grouping-options)
     - [Settings Tab](#settings-tab)
       - [General](#general)
       - [Game Files](#game-files)
       - [Mod Storage](#mod-storage)
       - [mod.io Integration](#modio-integration)
+      - [Suppressed Update Checks](#suppressed-update-checks)
       - [Footer](#footer)
   - [Mod Storage Locations](#mod-storage-locations)
   - [Presets](#presets-1)
@@ -129,7 +131,7 @@ The left sidebar is always visible and contains:
 - **Discord** - opens the community Discord server.
 - **Ko-fi** - opens the developer's Ko-fi page if you want to support development.
 - **Documentation** - opens this Github readme for information about the features of the app.
-- **LAUNCH GAME** - saves the current mod state and launches Anno 117 directly. Before launching, the app checks for missing required dependencies and warns you if any active mods have unresolved incompatibilities.
+- **LAUNCH GAME** - saves the current mod state and launches Anno 117 through Ubisoft Connect or Steam, so any launch arguments you set there (e.g. `/pipe` for third-party tools) are applied. If the install can't be matched to either launcher, the game exe is started directly. Before launching, the app checks for missing required dependencies and warns you if any active mods have unresolved incompatibilities.
 
 ---
 
@@ -305,7 +307,91 @@ Some mods expose configurable value options in their `modinfo.json` (colour valu
   - **Slider** - move the slider button in incremental steps to any value inside the min and max value.
   - **Text / Colour** - free-text entry; colour options include a colour-picker button for specific mods.
 - Changes are saved to `active-options.jsonc` in your mod folder and applied next time you launch the game.
+- **Option groups** - mod authors can bundle related options into collapsible sections: an entry with `"type": "group"` (plus a `label` and an optional `"collapsed": true`) becomes a section header, and any option with `"group": "<group key>"` is shown inside it. Click a header to expand or collapse it. Groups are display-only and are never written to `active-options.jsonc`. See [For Mod Authors: Grouping Options](#for-mod-authors-grouping-options) for an example.
 - **Reset to Default** resets options for the selected mod. **Reset All to Default** resets every mod at once.
+
+#### For Mod Authors: Grouping Options
+
+Options live in the `Options` block of your `modinfo.json`. To group them, add one entry per group and point each option at it:
+
+| Key | Where | Meaning |
+|---|---|---|
+| `"type": "group"` | group entry | Marks the entry as a section header instead of an option. |
+| `"label"` | group entry | Header text. Without it, the group's key is shown. |
+| `"collapsed"` | group entry | `true` starts the section closed. Default: `false` (open). |
+| `"group"` | option | Key of the group the option belongs to. |
+
+Example:
+
+```json
+"Options": {
+  "economy": {
+    "type": "group",
+    "label": "Economy"
+  },
+  "visuals": {
+    "type": "group",
+    "label": "Visuals",
+    "collapsed": true
+  },
+  "marketRadius": {
+    "group": "economy",
+    "label": "Market radius multiplier",
+    "type": "slider",
+    "default": "1.5",
+    "values": ["0.5", "3", "0.1"],
+    "labels": ["Multiplies the market's influence radius (vanilla: 1)"]
+  },
+  "tradeMode": {
+    "group": "economy",
+    "label": "Trade mode",
+    "type": "enum",
+    "default": "balanced",
+    "values": ["cheap", "balanced", "expensive"],
+    "labels": ["Goods are 25% cheaper", "Vanilla prices", "Goods are 25% more expensive"]
+  },
+  "showStalls": {
+    "group": "visuals",
+    "label": "Show market stalls",
+    "type": "toggle",
+    "default": "true",
+    "labels": ["Stalls are visible around the market", "Market square stays empty"]
+  },
+  "awningColour": {
+    "group": "visuals",
+    "label": "Awning colour",
+    "type": "text",
+    "default": "-3381760",
+    "labels": ["Signed ARGB integer, or use the colour picker"]
+  },
+  "debugLog": {
+    "label": "Write debug log",
+    "type": "toggle",
+    "default": "false",
+    "labels": ["Extra entries are written to mod-loader.log", "No extra log output"]
+  }
+}
+```
+
+When the mod is selected, *Economy* is open and *Visuals* is closed because of `"collapsed": true`. `debugLog` has no `group`, so it is shown on its own below the groups:
+
+<img src="docs/images/tweaking-groups-default.png" alt="Economy open, Visuals collapsed, ungrouped option below" width="420">
+
+Clicking the *Visuals* header opens it:
+
+<img src="docs/images/tweaking-groups-expanded.png" alt="Both groups expanded" width="420">
+
+With both groups closed, only the headers and the ungrouped option remain:
+
+<img src="docs/images/tweaking-groups-collapsed.png" alt="Both groups collapsed" width="420">
+
+Notes:
+
+- Groups appear in the order they are listed in `Options`, always **above** ungrouped options. Options inside a group keep their listed order.
+- `collapsed` only sets the starting state. The section is reset to it every time the mod is selected again.
+- An option whose `group` names a key that is not a group entry is shown as ungrouped.
+- Group entries are not options. They have no value and are never written to `active-options.jsonc`.
+- Group labels are plain strings. Unlike `ModName`, they are not translated per language.
 
 ---
 
@@ -375,6 +461,7 @@ Files stored there:
 | `subscriptions.json` | mod.io subscription list |
 | `subscription_map.json` | Maps local mod IDs to mod.io IDs |
 | `collection_follows.json` | Followed collections |
+| `reddit_cache.json` | Last fetched r/anno posts, reused when Reddit rate-limits the feed |
 | `debug.log` | Rolling debug log (max 2 MB, auto-archived to `.bak`) |
 
 ---
@@ -401,12 +488,13 @@ When you follow a collection a preset named `<Collection Name> (Collection)` is 
 
 ## Load Order
 
-The load order determines the sequence in which the game applies mod patches. The app computes it from `LoadAfter` entries in each mod's `modinfo.json` using a two-phase topological sort:
+The load order determines the sequence in which the game applies mod patches. The app calculates it the same way the mod loader does:
 
-1. **Normal phase** - mods without a wildcard `*` in `LoadAfter`, sorted by category then name.
-2. **Late phase** - mods with `LoadAfter: ["*"]`, loaded after all normal mods.
+1. **Normal phase, then late phase** - mods with `"*"` in `LoadAfter` load after all others. `LoadAfter` entries only count within the same phase; mods that aren't installed are skipped.
+2. **Sub-mods first** - within a phase, sub-mods (folders with their own `modinfo.json` inside a mod) are processed before top-level mods. Each group is sorted alphabetically by `[Category] ModName` using the English texts.
+3. **Dependencies before dependents** - before a mod loads, the mods in its `LoadAfter` load first, in the order they are listed.
 
-Enable **Load Order** view in the Activation tab header to see the computed sequence. The position badge `#` shows each mod's final index.
+Sub-mods are sorted individually, so sub-mods of different mods can interleave, and a top-level mod itself usually loads after all sub-mods. Enable the **Load Order** view in the Activation tab header to see the sequence: every mod and sub-mod gets its own row, numbered from 1 in load order, and sub-mod rows show which mod they belong to.
 
 ---
 

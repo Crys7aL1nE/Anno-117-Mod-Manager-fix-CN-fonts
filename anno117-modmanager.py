@@ -631,10 +631,26 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         """Searches the Windows registry (Ubisoft launcher and Steam) and common installation directories for Anno117.exe. Returns the full path if found, otherwise an empty string."""
         possible_roots = []
 
+        def _exe_under(root):
+            if not root or not os.path.exists(root):
+                return None
+            for target in [
+                os.path.join(root, "Bin", "Win64", "Anno117.exe"),
+                os.path.join(root, "Anno 117 - Pax Romana", "Bin", "Win64", "Anno117.exe"),
+                os.path.join(root, "Anno117.exe"),
+            ]:
+                if os.path.exists(target):
+                    return os.path.realpath(target)
+            return None
+
         if IS_WINDOWS:
+            # 921 is Anno 117's Ubisoft Connect product ID (the demos are separate products).
+            # The registry knows the exact install folder, so it is checked before scanning drives,
+            # which can't tell the full game from a demo with the same inner folder name.
             reg_paths = [
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Ubisoft\Launcher\Installs\117"),
-                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Ubisoft\Launcher\Installs\117"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Ubisoft\Launcher\Installs\921"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Ubisoft\Launcher\Installs\921"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Ubisoft\Launcher\Installs\921"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 3274580"),
             ]
             for hive, key_path in reg_paths:
@@ -643,8 +659,11 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                         for val_name in ["InstallDir", "InstallLocation"]:
                             try:
                                 path, _ = winreg.QueryValueEx(key, val_name)
-                                if path: possible_roots.append(path)
-                            except FileNotFoundError: continue
+                            except FileNotFoundError:
+                                continue
+                            found = _exe_under(path)
+                            if found:
+                                return found
                 except (FileNotFoundError, OSError): continue
 
             program_files = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
@@ -696,17 +715,11 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                 except Exception:
                     continue
 
-        # Fall back to the known-root candidates collected above (registry / fixed paths)
+        # Fall back to the known default install locations collected above
         for root in list(dict.fromkeys(possible_roots)):
-            if not root or not os.path.exists(root):
-                continue
-            for target in [
-                os.path.join(root, "Bin", "Win64", "Anno117.exe"),
-                os.path.join(root, "Anno 117 - Pax Romana", "Bin", "Win64", "Anno117.exe"),
-                os.path.join(root, "Anno117.exe"),
-            ]:
-                if os.path.exists(target):
-                    return os.path.realpath(target)
+            found = _exe_under(root)
+            if found:
+                return found
 
         return None
 
@@ -1125,8 +1138,20 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                 if not isinstance(deps, dict):
                     deps = {}
 
+                # The mod loader sorts by "[Category] ModName" using the English texts (as printed
+                # in mod-loader.log), regardless of the app language.
+                def _english(key):
+                    val = data.get(key)
+                    if isinstance(val, dict):
+                        val = val.get("English") or next((v for v in val.values() if isinstance(v, str) and v), "")
+                    return val if isinstance(val, str) else ""
+                _en_cat = _english("Category")
+                _en_name = _english("ModName") or m_id
+                loader_sort_key = f"[{_en_cat}] {_en_name}" if _en_cat else _en_name
+
                 mod_entry = {
                     "id": m_id,
+                    "loader_sort_key": loader_sort_key,
                     "name": get_localized("ModName", get_localized("Name", m_id)),
                     "category": category_display,
                     "version": str(data.get("Version", "1.0.0")),
@@ -1540,11 +1565,29 @@ class AnnoModManagerApp(TkinterDnD.Tk):
 
         try:
             with zipfile.ZipFile(zip_path, 'r') as zref:
-                mod_internal_path = None
+                # The mod's own modinfo is the shallowest one in the archive; deeper ones belong to
+                # sub-mods. Archive order can't be trusted (sub-mod folders like "[Base] ..." sort
+                # before "modinfo.json"), so pick by depth rather than taking the first match.
+                modinfo_dirs = []
                 for file_info in zref.infolist():
-                    if file_info.filename.endswith("modinfo.json") or file_info.filename.endswith("modinfo.jsonc"):
-                        mod_internal_path = os.path.dirname(file_info.filename)
-                        break
+                    entry = file_info.filename.replace("\\", "/")
+                    if entry.startswith("__MACOSX/") or file_info.is_dir():
+                        continue
+                    if entry.rsplit("/", 1)[-1].lower() in ("modinfo.json", "modinfo.jsonc"):
+                        modinfo_dirs.append(os.path.dirname(entry))
+                mod_internal_path = (min(modinfo_dirs, key=lambda d: (d.count("/") + (1 if d else 0), d))
+                                     if modinfo_dirs else None)
+
+                # Independent mods are modinfo folders with no modinfo.json in any folder above them.
+                # Normally that is exactly one; an archive bundling several mods side by side (without
+                # a modinfo.json of its own above them) gets each of them installed.
+                dir_set = set(modinfo_dirs)
+                def _has_mod_above(d):
+                    parts = d.split("/") if d else []
+                    return any("/".join(parts[:i]) in dir_set for i in range(len(parts)))
+                independent_dirs = sorted({d for d in modinfo_dirs if not _has_mod_above(d)})
+                if len(independent_dirs) > 1:
+                    return self._install_multiple_mods(zref, independent_dirs, target_base_dir, silent)
 
                 if mod_internal_path is None:
                     self._imperial_alert(T(1999101194), T(1999101227), is_error=True)
@@ -1640,6 +1683,72 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         except Exception as e:
             self._imperial_alert(T(1999101282), T(1999101390, e), is_error=True)
             return False
+
+    def _install_multiple_mods(self, zref, mod_dirs, target_base_dir, silent=False):
+        """Installs an archive that bundles several independent mods side by side (each folder has
+        its own modinfo.json and none sits above them). Each folder - sub-mods included - is
+        installed like a single mod; one summary message at the end. Returns True if at least one
+        mod was installed."""
+        temp_extract = os.path.join(target_base_dir, "_temp_ext")
+        if os.path.exists(temp_extract):
+            shutil.rmtree(temp_extract, ignore_errors=True)
+        installed = []   # (folder name, ModID or None)
+        try:
+            zref.extractall(temp_extract)
+            for mod_dir in mod_dirs:
+                folder_name = os.path.basename(mod_dir)
+                final_destination = os.path.join(target_base_dir, folder_name)
+                if os.path.exists(final_destination):
+                    if not self._imperial_question(T(1999101210), T(1999101351, folder_name)):
+                        continue
+                    shutil.rmtree(final_destination)
+                shutil.move(os.path.join(temp_extract, mod_dir), final_destination)
+
+                mod_id = None
+                for info_file in ("modinfo.json", "modinfo.jsonc"):
+                    info_path = os.path.join(final_destination, info_file)
+                    if os.path.exists(info_path):
+                        try:
+                            mod_id = json.loads(self.strip_jsonc_comments(self._read_text_file_robust(info_path))).get("ModID")
+                        except Exception:
+                            pass
+                        break
+                installed.append((folder_name, mod_id))
+        finally:
+            if os.path.exists(temp_extract):
+                shutil.rmtree(temp_extract, ignore_errors=True)
+
+        if not installed:
+            return False
+
+        # Activate each according to the "newly installed mods" setting, like a single install
+        self.mods = self.get_all_mod_metadata()
+        self.parse_active_profile()
+        activation_mode = self.enable_new_mods_var.get()
+        for _, mod_id in installed:
+            if not mod_id:
+                continue
+            if activation_mode == "keep":
+                activate = self.mod_statuses.get(mod_id, {}).get("active", False)
+            else:
+                activate = (activation_mode == "on")
+            if activate and not self._check_and_confirm_incompatible(mod_id):
+                activate = False
+            self.toggle_mod_status(mod_id, activate)
+
+        self.mods = self.get_all_mod_metadata()
+        self.parse_active_profile()
+
+        if getattr(self, '_pending_modio_mapping', None):
+            modio_id, modio_name = self._pending_modio_mapping
+            self._store_modio_mapping(modio_id, modio_name)
+            self._pending_modio_mapping = None
+
+        if not silent:
+            self._imperial_alert(T(1999101201), T(1999101354, ", ".join(name for name, _ in installed)))
+            if getattr(self, 'jump_to_activation', True):
+                self.switch_tab("Mod Activation", select_id=installed[0][1])
+        return True
 
     def render_installation_tab(self):
         """Builds the Manual Install tab UI: a Nexus URL paste field, a ZIP file picker and a drag-and-drop target rectangle."""
@@ -1898,6 +2007,16 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         so Steam sets up Proton and chains the launcher properly — execing the .exe directly
         would just hand a Windows binary to the kernel."""
         if IS_WINDOWS:
+            # Start through the owning launcher so the launch arguments configured there
+            # (e.g. /pipe for third-party tools) are applied; running the exe directly skips them.
+            uri = self._launcher_uri()
+            if uri:
+                try:
+                    os.startfile(uri)
+                    print(f"[launch] Started via {uri}")
+                    return
+                except OSError as e:
+                    print(f"[launch] {uri} failed ({e}) - starting the exe directly")
             subprocess.Popen([self.game_exe_path], creationflags=subprocess.CREATE_NO_WINDOW)
             return
         if IS_LINUX:
@@ -1920,6 +2039,47 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         # Non-Steam install (Lutris/Heroic/Bottles/raw Wine): hand the path off and let
         # whatever launcher is registered for .exe handle it.
         subprocess.Popen([self.game_exe_path])
+
+    _STEAM_APP_ID = "3274580"
+
+    def _launcher_uri(self):
+        """Returns the launcher URI that starts the configured install (Steam or Ubisoft Connect),
+        or None if the install can't be attributed to either - the caller then runs the exe directly."""
+        if '/steamapps/' in self.game_exe_path.replace('\\', '/').lower():
+            return f"steam://rungameid/{self._STEAM_APP_ID}"
+        product_id = self._ubisoft_product_id_for_install()
+        if product_id:
+            return f"uplay://launch/{product_id}/0"
+        return None
+
+    def _ubisoft_product_id_for_install(self):
+        """Finds the Ubisoft Connect product ID whose registered install folder is the folder of the
+        configured game exe. Matching on the folder (rather than hard-coding Anno 117's ID) keeps the
+        full game and the demos, which are separate products, apart."""
+        if not IS_WINDOWS:
+            return None
+        game_root = os.path.normcase(os.path.normpath(
+            os.path.dirname(os.path.dirname(os.path.dirname(self.game_exe_path)))))
+        for key_path in (r"SOFTWARE\WOW6432Node\Ubisoft\Launcher\Installs", r"SOFTWARE\Ubisoft\Launcher\Installs"):
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as installs:
+                    index = 0
+                    while True:
+                        try:
+                            product_id = winreg.EnumKey(installs, index)
+                        except OSError:
+                            break
+                        index += 1
+                        try:
+                            with winreg.OpenKey(installs, product_id) as product_key:
+                                install_dir, _ = winreg.QueryValueEx(product_key, "InstallDir")
+                        except OSError:
+                            continue
+                        if install_dir and os.path.normcase(os.path.normpath(install_dir)) == game_root:
+                            return product_id
+            except OSError:
+                continue
+        return None
 
     @staticmethod
     def _steam_root_for_path(path):
@@ -2104,7 +2264,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             url = f"{MODIO_BASE_URL}/games/11358/mods?_sort=-date_live&_limit=10"
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 401:
-                self.after(0, self._handle_modio_401)
+                self.after(0, lambda r=res: self._handle_modio_401(r))
                 return
             res.raise_for_status()
             for mod in res.json().get('data', []):
@@ -2143,7 +2303,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             url = f"{MODIO_BASE_URL}/me/subscribed?game_id=11358&_sort=-date_updated&_limit=20"
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 401:
-                self.after(0, self._handle_modio_401)
+                self.after(0, lambda r=res: self._handle_modio_401(r))
                 return
             res.raise_for_status()
 
@@ -2256,12 +2416,39 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             self.render_activation_tab()
         self._imperial_alert(T(1999101490), f"{mod_name}\n\n{T(1999101489)}")
 
+    # Reddit allows anonymous feed clients roughly one request per minute per IP (x-ratelimit headers);
+    # a second request inside that window gets a 429. Posts are cached so refreshes don't lose them.
+    _REDDIT_MIN_INTERVAL = 60
+
+    def _load_reddit_cache(self):
+        """Returns (fetched_at, items) from the on-disk Reddit cache, or (0, [])."""
+        try:
+            with open(os.path.join(self.appdata_dir, "reddit_cache.json"), 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return float(data.get("fetched_at", 0)), list(data.get("items", []))
+        except Exception:
+            return 0, []
+
+    def _save_reddit_cache(self, items):
+        try:
+            with open(os.path.join(self.appdata_dir, "reddit_cache.json"), 'w', encoding='utf-8') as f:
+                json.dump({"fetched_at": time.time(), "items": items}, f)
+        except Exception as e:
+            print(f"Reddit cache save failed: {e}")
+
     def _fetch_reddit_worker(self, done_cb):
         """Fetches the latest posts from r/anno via Reddit's public RSS/Atom feed.
 
         Reddit's JSON API (www.reddit.com/*.json) started returning a Cloudflare-level
         403 for anonymous requests regardless of User-Agent. The *.rss endpoint is not
-        subject to that block, so we parse the Atom feed it returns instead."""
+        subject to that block, so we parse the Atom feed it returns instead. The last good
+        result is cached on disk: reused without a request while it is under a minute old,
+        and as a fallback whenever Reddit rate-limits (429) or fails."""
+        cached_at, cached_items = self._load_reddit_cache()
+        if cached_items and time.time() - cached_at < self._REDDIT_MIN_INTERVAL:
+            done_cb(cached_items)
+            return
+
         items = []
         try:
             url = "https://www.reddit.com/r/anno/new.rss?limit=10"
@@ -2270,8 +2457,9 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                 'Accept': 'application/atom+xml'
             }
             res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code == 401:
-                self.after(0, self._handle_modio_401)
+            if res.status_code == 429:
+                print(f"Reddit rate limit hit (reset in {res.headers.get('x-ratelimit-reset', '?')}s) - using cached posts.")
+                items = cached_items
                 return
             res.raise_for_status()
 
@@ -2323,8 +2511,11 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                     "badge_text": "r/anno",
                     "badge_color": "#ff4500"   # Reddit orange
                 })
+            if items:
+                self._save_reddit_cache(items)
         except Exception as e:
-            print(f"Reddit fetch failed: {e}")
+            print(f"Reddit fetch failed: {e} - using cached posts.")
+            items = cached_items
         finally:
             done_cb(items)
 
@@ -2342,7 +2533,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         try:
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 401:
-                self.after(0, self._handle_modio_401)
+                self.after(0, lambda r=res: self._handle_modio_401(r))
                 return
             res.raise_for_status()
             data = res.json()
@@ -2570,26 +2761,22 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             self.stats_label_var.set(stats_text)
 
     def _compute_load_order(self, top_mods):
-        """Computes the Anno mod loader load order for active top-level mods.
+        """Computes the Anno mod loader load order for the active top-level mods AND all of their
+        sub-mods, returned as one flat list in the exact order the loader loads them.
 
-        Phase split (determined by the mod's own LoadAfter only):
-          Normal — LoadAfter does NOT contain '*'
-          Late   — LoadAfter DOES contain '*'
-
-        Normal phase ordering (category+name alphabetical, observed in modloader.log):
-          Group 1 — mods whose LoadAfter references ONLY late/cross-phase mods
-                    (their dep is ignored but they still load before everything else)
-          Group 2 — mods with real same-phase LoadAfter deps (topological sort)
-          Group 3 — mods with no LoadAfter at all (category+name alphabetical)
-          Cross-phase LoadAfter entries are silently ignored for ordering.
-
-        Late phase ordering (ModID alphabetical, topological for late→late deps):
-          All late mods sorted by ModID; late→late LoadAfter respected,
-          cross-phase and '*' entries ignored.
+        Reproduces the loader's algorithm (verified position-for-position against mod-loader.log):
+          1. Two phases: Normal (no '*' in LoadAfter), then Late ('*' in LoadAfter). LoadAfter
+             entries only count within the same phase; missing mods are skipped.
+          2. Within a phase, nested sub-mods are processed before top-level mods; each group is
+             sorted by "[Category] ModName" using the English texts (the name shown in the log).
+          3. Mods are visited in that order; before a mod is placed, its LoadAfter mods are placed
+             first, recursively, in the order they are listed (depth-first).
+        Sub-mods are sorted individually, so sub-mods of different packs interleave, and a
+        top-level mod's own position always comes after all normal-phase sub-mods.
         """
         statuses = self.mod_statuses
 
-        active = [
+        active_tops = [
             m for m in top_mods
             if not m.get('manually_disabled')
             and bool(statuses.get(m['id'], {}).get('active',
@@ -2597,112 +2784,52 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             and not statuses.get(m['id'], {}).get('uninstalled', False)
         ]
 
-        installed_ids = {m['id'] for m in active}
-        normal = [m for m in active if '*' not in m.get('deps', {}).get('LoadAfter', [])]
-        late   = [m for m in active if '*' in  m.get('deps', {}).get('LoadAfter', [])]
+        # Sub-mods load whenever their top-level mod is active, at any nesting depth
+        all_mods = getattr(self, 'mods', None) or top_mods
+        children = {}
+        for m in all_mods:
+            if m.get('parent_path'):
+                children.setdefault(os.path.normcase(os.path.normpath(m['parent_path'])), []).append(m)
+        active, seen_paths = [], set()
+        stack = list(active_tops)
+        while stack:
+            m = stack.pop()
+            key = os.path.normcase(os.path.normpath(m.get('path', '')))
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            active.append(m)
+            stack.extend(children.get(key, []))
 
-        def sort_normal(phase_mods):
-            if not phase_mods:
-                return []
-            phase_ids = {m['id'] for m in phase_mods}
-            by_id     = {m['id']: m for m in phase_mods}
-            cat_name  = lambda m: (m.get('category', '') + m['name'])
+        def is_late(m):
+            return '*' in m.get('deps', {}).get('LoadAfter', [])
 
-            # Classify each mod
-            cross_phase_only = []   # Group 1: LoadAfter exists but all refs are late/missing
-            has_real_deps    = []   # Group 2: at least one same-phase LoadAfter dep
-            no_deps          = []   # Group 3: empty LoadAfter
+        def sort_key(m):
+            return (0 if m.get('parent_path') else 1, m.get('loader_sort_key') or m.get('name') or m['id'])
 
+        result = []
+        for late_phase in (False, True):
+            phase_mods = [m for m in active if is_late(m) == late_phase]
+            by_id = {}
             for m in phase_mods:
-                la_all = [la for la in m.get('deps', {}).get('LoadAfter', []) if la != '*']
-                la_real = [la for la in la_all if la in phase_ids and la in installed_ids]
-                if not la_all:
-                    no_deps.append(m)
-                elif la_real:
-                    has_real_deps.append(m)
-                else:
-                    cross_phase_only.append(m)
+                by_id.setdefault(m['id'], m)
+            placed, in_progress = set(), set()
 
-            # Group 1: cross-phase-only — load first, category+name order
-            result = sorted(cross_phase_only, key=cat_name)
+            def place(m):
+                if m['id'] in placed or m['id'] in in_progress:
+                    return  # already placed, or a circular LoadAfter chain
+                in_progress.add(m['id'])
+                for dep_id in m.get('deps', {}).get('LoadAfter', []):
+                    dep = by_id.get(dep_id)
+                    if dep is not None:
+                        place(dep)
+                in_progress.discard(m['id'])
+                placed.add(m['id'])
+                result.append(m)
 
-            # Group 2: real same-phase deps — Kahn's topological sort, category+name tiebreak
-            in_degree  = {m['id']: 0 for m in has_real_deps}
-            successors = {m['id']: [] for m in has_real_deps}
-            real_dep_ids = {m['id'] for m in has_real_deps}
-            for m in has_real_deps:
-                for la in m.get('deps', {}).get('LoadAfter', []):
-                    if la != '*' and la in real_dep_ids and la in installed_ids:
-                        successors[la].append(m['id'])
-                        in_degree[m['id']] += 1
-            queue = sorted(
-                [mid for mid, deg in in_degree.items() if deg == 0],
-                key=lambda mid: cat_name(by_id[mid])
-            )
-            visited = set()
-            while queue:
-                current = queue.pop(0)
-                if current in visited:
-                    continue
-                visited.add(current)
-                result.append(by_id[current])
-                newly_ready = sorted(
-                    [s for s in successors[current] if in_degree[s] - 1 == 0],
-                    key=lambda mid: cat_name(by_id[mid])
-                )
-                for s in successors[current]:
-                    in_degree[s] -= 1
-                queue = newly_ready + queue
-            # Circular dep fallback
-            result.extend(sorted(
-                [m for m in has_real_deps if m['id'] not in visited],
-                key=cat_name))
-
-            # Group 3: no LoadAfter — category+name order
-            result.extend(sorted(no_deps, key=cat_name))
-            return result
-
-        def sort_late(phase_mods):
-            if not phase_mods:
-                return []
-            phase_ids  = {m['id'] for m in phase_mods}
-            by_id      = {m['id']: m for m in phase_mods}
-            in_degree  = {m['id']: 0 for m in phase_mods}
-            successors = {m['id']: [] for m in phase_mods}
-
-            for m in phase_mods:
-                for la in m.get('deps', {}).get('LoadAfter', []):
-                    if la != '*' and la in phase_ids and la in installed_ids:
-                        successors[la].append(m['id'])
-                        in_degree[m['id']] += 1
-
-            queue = sorted(
-                [mid for mid, deg in in_degree.items() if deg == 0],
-                key=lambda mid: mid   # ModID alphabetical
-            )
-            result = []
-            visited = set()
-            while queue:
-                current = queue.pop(0)
-                if current in visited:
-                    continue
-                visited.add(current)
-                result.append(by_id[current])
-                newly_ready = sorted(
-                    [s for s in successors[current]],
-                    key=lambda mid: mid
-                )
-                for s in successors[current]:
-                    in_degree[s] -= 1
-                queue = newly_ready + queue
-
-            result.extend(sorted(
-                [m for m in phase_mods if m['id'] not in visited],
-                key=lambda m: m['id']
-            ))
-            return result
-
-        return sort_normal(normal) + sort_late(late)
+            for m in sorted(phase_mods, key=sort_key):
+                place(m)
+        return result
 
     def render_activation_tab(self, select_id=None, search_query=None):
         """Renders the Mod Activation tab: preset management row, stats bar, search/filter row, sortable column header and the full scrollable mod list with checkboxes, icons and sub-mod rows."""
@@ -2937,20 +3064,37 @@ class AnnoModManagerApp(TkinterDnD.Tk):
 
         # 4. Draw Mods
         if self.show_load_order:
-            ordered = self._compute_load_order(all_top_mods)
-            if query:
-                ordered = [m for m in ordered
-                           if query in m.get('name', '').lower()
-                           or query in m.get('category', '').lower()]
+            # One row per mod AND sub-mod, numbered 1..N in the exact order the loader loads them.
+            # The loader sorts sub-mods individually, so they appear on their own with a note
+            # naming the mod they belong to.
+            flat_order = self._compute_load_order(all_top_mods)
+            load_order_positions = {m['id']: i + 1 for i, m in enumerate(flat_order)}
+            mod_by_path = {os.path.normcase(os.path.normpath(m['path'])): m for m in self.mods}
 
-            load_order_positions = {m['id']: i + 1 for i, m in enumerate(ordered)}
-            ordered_ids = {m['id'] for m in ordered}
+            def _parent_of(m):
+                if not m.get('parent_path'):
+                    return None
+                return mod_by_path.get(os.path.normcase(os.path.normpath(m['parent_path'])))
 
-            # Active mods in load order
-            if ordered:
+            rows = []
+            for m in flat_order:
+                parent = _parent_of(m)
+                if query and not (query in m.get('name', '').lower()
+                                  or query in m.get('category', '').lower()
+                                  or (parent and query in parent.get('name', '').lower())):
+                    continue
+                rows.append((m, parent))
+
+            # Every active top-level mod has a row, so inactive = top-level mods not in the order
+            ordered_ids = {m['id'] for m in flat_order}
+
+            if rows:
                 self._draw_separator(T(1999101437))
-            for mod in ordered:
-                self._draw_mod_row(self.scrollable_frame, mod, self.mods, statuses, True, indent=0, select_id=select_id, load_order_pos=load_order_positions[mod['id']])
+            for m, parent in rows:
+                if parent is None:
+                    self._draw_mod_row(self.scrollable_frame, m, self.mods, statuses, True, indent=0, select_id=select_id, load_order_pos=load_order_positions[m['id']], flat=True)
+                else:
+                    self._draw_mod_row(self.scrollable_frame, m, self.mods, statuses, True, indent=1, select_id=select_id, load_order_positions=load_order_positions, flat=True, parent_note=parent.get('name', parent['id']))
 
             # Inactive mods at the bottom, alphabetical
             inactive = sorted(
@@ -3014,14 +3158,15 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             tk.Label(sep_container, text=f" {text} ", font=FONT_BOLD_SMALL, bg=BG_MAIN, fg=FG_DIM).pack(side="left", padx=10)
             tk.Frame(sep_container, bg=line_color, height=2).pack(fill="x", padx=10, side="left", expand=True)
 
-    def _draw_mod_row(self, parent_widget, current_mod, all_mods, statuses, is_active, indent=0, select_id=None, load_order_pos=None):
+    def _draw_mod_row(self, parent_widget, current_mod, all_mods, statuses, is_active, indent=0, select_id=None, load_order_pos=None, load_order_positions=None, flat=False, parent_note=None):
         """Renders a single mod entry row inside the activation tab list: checkbox or indent marker, category badge, status/warning icons (conflict, missing dep, deprecated, tweaks) and the mod name coloured by state. Binds hover, click and keyboard navigation."""
         row_bg = BG_SECTION
         hover_bg = "#253b59"
         select_bg = "#253b59"
 
         row = tk.Frame(parent_widget, bg=row_bg, takefocus=1, highlightthickness=1, highlightbackground=row_bg, highlightcolor=FG_MAIN)
-        row.pack(fill="x", padx=(10 + (indent * 25), 10), pady=2)
+        # flat=True: Load Order view, where every mod and sub-mod is its own row in load order
+        row.pack(fill="x", padx=(10 + (0 if flat else indent * 25), 10), pady=2)
 
         def scroll_to_view(widget):
             self.canvas.update_idletasks()
@@ -3126,10 +3271,17 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             chk.bind("<Enter>", on_enter)
             chk.bind("<Leave>", on_leave)
         else:
-            indent_lbl = tk.Label(row, text="└─", font=FONT_SMALL, bg=row_bg, fg=FG_DIM)
+            indent_lbl = tk.Label(row, text="↳" if flat else "└─", font=FONT_SMALL, bg=row_bg, fg=FG_DIM)
             indent_lbl.pack(side="left", padx=(12, 0))
             indent_lbl.bind("<Enter>", on_enter)
             indent_lbl.bind("<Leave>", on_leave)
+            # Sub-mods are sorted individually by the loader - show their own load position
+            if load_order_positions and current_mod['id'] in load_order_positions:
+                sub_pos_lbl = tk.Label(row, text=f"{load_order_positions[current_mod['id']]}", font=FONT_XSMALL, bg=row_bg, fg=FG_GOLD, width=3, anchor="e")
+                sub_pos_lbl.pack(side="left", padx=(2, 4))
+                sub_pos_lbl.bind("<Enter>", on_enter)
+                sub_pos_lbl.bind("<Leave>", on_leave)
+                sub_pos_lbl.bind("<Button-1>", on_click)
 
         cat_text = current_mod.get('category', '')
         cat_lbl = tk.Label(row, text=cat_text, font=FONT_BOLD_SMALL, bg=row_bg, fg=FG_MAIN, width=8, anchor="w")
@@ -3264,16 +3416,27 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         lbl.bind("<Leave>", on_leave)
         lbl.bind("<Button-1>", on_click)
 
+        if parent_note:
+            note_lbl = tk.Label(row, text=T(1999101498, parent_note), font=FONT_XSMALL, bg=row_bg, fg=FG_DIM, anchor="e")
+            note_lbl.pack(side="right", padx=(6, 8))
+            note_lbl.bind("<Enter>", on_enter)
+            note_lbl.bind("<Leave>", on_leave)
+            note_lbl.bind("<Button-1>", on_click)
+
         if select_id and current_mod.get('id') == select_id:
             self.after(100, on_click)
 
-        submods = sorted(
-            [m for m in all_mods if m['parent_path'] == current_mod['path']],
-            key=lambda x: x['name'].lower()
-        )
+        if flat:
+            return row
+
+        submods = [m for m in all_mods if m['parent_path'] == current_mod['path']]
+        if load_order_positions:
+            submods.sort(key=lambda x: (load_order_positions.get(x['id'], float('inf')), x['name'].lower()))
+        else:
+            submods.sort(key=lambda x: x['name'].lower())
 
         for sm in submods:
-            self._draw_mod_row(parent_widget, sm, all_mods, statuses, is_active, indent + 1, select_id=select_id)
+            self._draw_mod_row(parent_widget, sm, all_mods, statuses, is_active, indent + 1, select_id=select_id, load_order_positions=load_order_positions)
 
         return row
 
@@ -3503,24 +3666,44 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         canvas_window = canvas.create_window((0, 0), window=container, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        def _on_configure(event):
-            canvas.itemconfig(canvas_window, width=event.width)
+        def _update_scroll(event=None):
+            """Re-measures the content - on canvas resize AND whenever the content grows
+            (e.g. a long LoadAfter list or a banner loading in) - and shows the scrollbar only when needed."""
             bbox = canvas.bbox("all")
+            if not bbox:
+                return
             canvas.configure(scrollregion=bbox)
-
             if bbox[3] <= canvas.winfo_height():
-                scrollbar.pack_forget()
-                canvas.unbind_all("<MouseWheel>")
-            else:
-                scrollbar.pack(side="right", fill="y")
-                canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel_right))
+                if scrollbar.winfo_ismapped():
+                    scrollbar.pack_forget()
+                canvas.yview_moveto(0)
+            elif not scrollbar.winfo_ismapped():
+                # before=canvas: the canvas already claims the full width, so the scrollbar must be placed first
+                scrollbar.pack(side="right", fill="y", before=canvas)
 
-        canvas.bind("<Configure>", _on_configure)
+        def _on_canvas_configure(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+            _update_scroll()
+
+        canvas.bind("<Configure>", _on_canvas_configure)
+        container.bind("<Configure>", _update_scroll)
 
         def _on_mousewheel_right(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            if scrollbar.winfo_ismapped():
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        def _wheel_off(event):
+            # Tk also fires <Leave> when the pointer moves onto a widget inside the panel;
+            # only release the wheel once the pointer has really left the canvas.
+            widget = canvas.winfo_containing(*canvas.winfo_pointerxy())
+            while widget is not None:
+                if widget == canvas:
+                    return
+                widget = widget.master
+            canvas.unbind_all("<MouseWheel>")
+
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel_right))
+        canvas.bind("<Leave>", _wheel_off)
         canvas.pack(side="left", fill="both", expand=True)
 
         SAFE_WRAP = 450
@@ -4848,8 +5031,12 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         btn_authorize.pack(pady=10)
         self._bind_hover(btn_authorize, "#2ecc71", "#36e780")
 
-    def _handle_modio_401(self):
-        """Called when any mod.io API returns 401 — token has expired or been revoked."""
+    def _handle_modio_401(self, response=None):
+        """Called when any mod.io API returns 401 — token has expired or been revoked, or (error_ref 11002)
+        the API key itself is no longer valid, which needs a new key rather than a re-login."""
+        if self._is_invalid_api_key(response):
+            self._handle_invalid_api_key()
+            return
         self.modio_token = ""
         self.settings["modio_token"] = ""
         self.save_settings()
@@ -4858,6 +5045,34 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             self._imperial_alert(T(1999101188), T(1999101238), is_error=True),
             self.switch_tab("Settings")
         ])
+
+    def _is_invalid_api_key(self, response):
+        """True if mod.io rejected the request because the API key itself is invalid (error_ref 11002) -
+        e.g. the user revoked or regenerated it on mod.io. Distinct from an expired/revoked access token."""
+        if response is None or response.status_code != 401:
+            return False
+        try:
+            return response.json().get('error', {}).get('error_ref') == 11002
+        except Exception:
+            return False
+
+    def _handle_invalid_api_key(self):
+        """Clears the dead API key (and the token issued with it) and sends the user to the API key setup,
+        instead of retrying the login with a key mod.io will keep rejecting."""
+        if not self.settings.get("modio_api_key"):
+            # Already handled by another request that failed on the same dead key
+            return
+        print("[mod.io] Stored API key rejected (error_ref 11002) - prompting for a new key.")
+        self.modio_api_key = ""
+        self.modio_token = ""
+        self.modio_token_expires = 0
+        self.settings["modio_api_key"] = ""
+        self.settings["modio_token"] = ""
+        self.settings["modio_token_expires"] = 0
+        self.save_settings()
+        self.refresh_sidebar_state()
+        self._imperial_alert(T(1999101196), T(1999101497), is_error=True)
+        self._prompt_api_key_setup()
 
     def _prompt_modio_auth(self):
         """Fetches latest agreements from mod.io and shows the consent dialog."""
@@ -4874,6 +5089,8 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             if res.status_code == 200:
                 terms_data = res.json()
                 self._show_consent_dialog(terms_data)
+            elif self._is_invalid_api_key(res):
+                self._handle_invalid_api_key()
             else:
                 # Fallback if API is down
                 msg = T(1999101300)
@@ -5154,10 +5371,18 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         try:
             url_req = f"{MODIO_BASE_URL}/oauth/emailrequest"
             data_req = {'api_key': self.modio_api_key, 'email': email}
-            res_req = requests.post(url_req, data=data_req, headers={'Accept': 'application/json'})
+            res_req = requests.post(url_req, data=data_req, headers={'Accept': 'application/json'}, timeout=15)
 
             if res_req.status_code != 200:
-                err_msg = res_req.json().get('error', {}).get('message', 'Unknown Identification Error')
+                if self._is_invalid_api_key(res_req):
+                    self._handle_invalid_api_key()
+                    return
+                err = res_req.json().get('error', {})
+                print(f"[mod.io] emailrequest failed: {res_req.status_code} {err}")
+                err_msg = err.get('message', 'Unknown Identification Error')
+                field_errors = err.get('errors') or {}
+                if isinstance(field_errors, dict) and field_errors:
+                    err_msg += "\n\n" + "\n".join(str(v) for v in field_errors.values())
                 self._imperial_alert(T(1999101196), err_msg, is_error=True)
                 return
 
@@ -5170,9 +5395,16 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                 'security_code': code,
                 'terms_agreed': 'true' if terms_agreed else 'false',
             }
-            res_exch = requests.post(url_exch, data=data_exch, headers={'Accept': 'application/json'})
+            res_exch = requests.post(url_exch, data=data_exch, headers={'Accept': 'application/json'}, timeout=15)
+            if res_exch.status_code != 200:
+                try:
+                    print(f"[mod.io] emailexchange failed: {res_exch.status_code} {res_exch.json().get('error', {})}")
+                except Exception:
+                    print(f"[mod.io] emailexchange failed: {res_exch.status_code}")
 
-            if res_exch.status_code == 200:
+            if self._is_invalid_api_key(res_exch):
+                self._handle_invalid_api_key()
+            elif res_exch.status_code == 200:
                 token_data = res_exch.json()
                 self.modio_token = token_data['access_token']
                 # Store the server-provided expiry timestamp directly
@@ -5196,7 +5428,16 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                 else:
                     self._imperial_alert(T(1999101196), res_exch.json().get('error', {}).get('message', 'Unknown error.'), is_error=True)
             else:
-                self._imperial_alert(T(1999101204), T(1999101241), is_error=True)
+                try:
+                    err = res_exch.json().get('error', {})
+                except Exception:
+                    err = {}
+                if err.get('error_ref') == 11014 or not err.get('message'):
+                    # Genuinely wrong/expired security code
+                    self._imperial_alert(T(1999101204), T(1999101241), is_error=True)
+                else:
+                    # Any other refusal - show mod.io's actual reason instead of blaming the code
+                    self._imperial_alert(T(1999101204), err['message'], is_error=True)
         except Exception as e:
             self._imperial_alert(T(1999101286), T(1999101396, e), is_error=True)
 
@@ -5489,7 +5730,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         try:
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 401:
-                self.after(0, self._handle_modio_401)
+                self.after(0, lambda r=res: self._handle_modio_401(r))
                 return
             res.raise_for_status()
             data = res.json()
@@ -5521,7 +5762,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             url = f"{MODIO_BASE_URL}/me/subscribed?game_id=11358&_limit=100"
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 401:
-                self.after(0, self._handle_modio_401)
+                self.after(0, lambda r=res: self._handle_modio_401(r))
                 return
             if res.status_code != 200:
                 return
@@ -5561,7 +5802,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         try:
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 401:
-                self.after(0, self._handle_modio_401)
+                self.after(0, lambda r=res: self._handle_modio_401(r))
                 return
             res.raise_for_status()
             data = res.json()
@@ -7488,8 +7729,38 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        canvas.bind('<Enter>', lambda e: canvas.bind_all("<MouseWheel>", lambda ev: canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units")))
-        canvas.bind('<Leave>', lambda e: canvas.unbind_all("<MouseWheel>"))
+        # Mouse wheel support for the complete right-side options area.
+        # Binding only the canvas causes dead zones over child widgets. Unbinding
+        # on canvas <Leave> is also unreliable when groups change their geometry.
+        def _on_options_mousewheel(event):
+            if not canvas.winfo_exists():
+                return "break"
+            delta = getattr(event, "delta", 0)
+            if delta:
+                canvas.yview_scroll(-1 if delta > 0 else 1, "units")
+            return "break"
+
+        def _activate_options_wheel(event=None):
+            canvas.bind_all("<MouseWheel>", _on_options_mousewheel)
+
+        def _deactivate_options_wheel_if_outside(event=None):
+            def check_pointer():
+                if not self.right_panel.winfo_exists():
+                    return
+                x, y = self.right_panel.winfo_pointerxy()
+                widget = self.right_panel.winfo_containing(x, y)
+                current = widget
+                while current is not None:
+                    if current == self.right_panel:
+                        return
+                    current = getattr(current, "master", None)
+                canvas.unbind_all("<MouseWheel>")
+            self.right_panel.after_idle(check_pointer)
+
+        self.right_panel.bind("<Enter>", _activate_options_wheel, add="+")
+        self.right_panel.bind("<Leave>", _deactivate_options_wheel_if_outside, add="+")
+        container.bind("<Enter>", _activate_options_wheel, add="+")
+        canvas.bind("<Enter>", _activate_options_wheel, add="+")
 
         active_options = self._load_active_options()
         mod_active_opts = active_options.get(mod['id'], {})
@@ -7499,9 +7770,78 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             tk.Label(container, text=T(1999101116), font=FONT_BODY, bg=BG_SECTION, fg=FG_DIM).pack(pady=20)
             return
 
+        # Build collapsible option groups first. A schema entry with type="group"
+        # is a visual-only header and is never written to active-options.jsonc.
+        group_hosts = {}
+        for group_key, group_details in options_schema.items():
+            if not isinstance(group_details, dict):
+                continue
+            if str(group_details.get('type', '')).lower() != 'group':
+                continue
+
+            group_frame = tk.Frame(
+                container,
+                bg=BG_SECTION,
+                highlightthickness=2,
+                highlightbackground=FG_GOLD,
+                highlightcolor=FG_GOLD,
+            )
+            group_frame.pack(fill="x", padx=20, pady=7)
+
+            group_label_text = str(group_details.get('label', group_key))
+            group_header = tk.Label(
+                group_frame,
+                text=group_label_text,
+                font=FONT_BODY,
+                bg=BG_SECTION,
+                fg=FG_MAIN,
+                anchor="w",
+                justify="left",
+                cursor="hand2",
+                padx=15,
+                pady=10,
+            )
+            group_header.pack(fill="x")
+
+            group_body = tk.Frame(group_frame, bg=BG_SECTION)
+            raw_collapsed = group_details.get('collapsed', False)
+            collapsed = (
+                raw_collapsed if isinstance(raw_collapsed, bool)
+                else str(raw_collapsed).strip().lower() == 'true'
+            )
+            group_state = {'collapsed': collapsed}
+
+            if not collapsed:
+                group_body.pack(fill="x", padx=5, pady=(0, 5))
+
+            def toggle_group(event=None, body=group_body, state=group_state):
+                state['collapsed'] = not state['collapsed']
+                if state['collapsed']:
+                    body.pack_forget()
+                else:
+                    body.pack(fill="x", padx=5, pady=(0, 5))
+                def refresh_group_scrollregion():
+                    container.update_idletasks()
+                    canvas.configure(scrollregion=canvas.bbox("all"))
+                canvas.after_idle(refresh_group_scrollregion)
+                return "break"
+
+            group_header.bind("<Button-1>", toggle_group)
+            group_hosts[group_key] = group_body
+
         for opt_key, opt_details in options_schema.items():
-            opt_frame = tk.Frame(container, bg=BG_SECTION, highlightthickness=1, highlightbackground=FG_DIM)
-            opt_frame.pack(fill="x", padx=20, pady=5)
+            if not isinstance(opt_details, dict):
+                continue
+            opt_type_for_layout = str(opt_details.get('type', 'text')).lower()
+            if opt_type_for_layout == 'group':
+                continue
+
+            group_key = opt_details.get('group')
+            option_parent = group_hosts.get(group_key, container)
+            in_group = option_parent is not container
+
+            opt_frame = tk.Frame(option_parent, bg=BG_SECTION, highlightthickness=1, highlightbackground=FG_DIM)
+            opt_frame.pack(fill="x", padx=5 if in_group else 20, pady=5)
 
             inner_padding = tk.Frame(opt_frame, bg=BG_SECTION)
             inner_padding.pack(fill="x", padx=15, pady=(8, 12))
@@ -8021,7 +8361,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         try:
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 401:
-                self.after(0, self._handle_modio_401)
+                self.after(0, lambda r=res: self._handle_modio_401(r))
                 return
             res.raise_for_status()
             data = res.json()
