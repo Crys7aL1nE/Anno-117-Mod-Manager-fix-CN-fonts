@@ -10,6 +10,17 @@ import tkinter.font as tkfont
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX   = platform.system() == "Linux"
 
+def _detect_wine():
+    """True when the Windows build runs under Wine/Proton (e.g. on Linux or the Steam Deck). Wine's ntdll exports wine_get_version."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        return hasattr(ctypes.windll.ntdll, "wine_get_version")
+    except Exception:
+        return False
+
+IS_WINE = _detect_wine()
+
 # Guard Windows-only imports
 if IS_WINDOWS:
     import winreg
@@ -44,6 +55,14 @@ except Exception:
     DND_FILES = None
     class TkinterDnD:
         Tk = tk.Tk
+
+
+def _norm_mod_id(mod_id):
+    """ModID as the game writes it in profiles: lowercase, other characters collapsed to '-'.
+    The LoadAfter wildcard '*' ("load after everything") is kept as is."""
+    if str(mod_id).strip() == '*':
+        return '*'
+    return re.sub(r'[^a-z0-9]+', '-', str(mod_id).lower()).strip('-')
 
 
 def _fmt_num(v):
@@ -531,6 +550,18 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             # without having to add Linux-specific bindings at each call site.
             self.bind_all("<Button-4>", lambda e: e.widget.event_generate("<MouseWheel>", delta=120))
             self.bind_all("<Button-5>", lambda e: e.widget.event_generate("<MouseWheel>", delta=-120))
+            # Tk's own file dialog hides dot-folders with no way to show them, but Wine/Proton
+            # prefixes live under ~/.steam, ~/.local/share, ~/.wine, ~/.var etc. Load the dialog
+            # code (the bogus option makes the call fail fast) and turn on its "show hidden" toggle.
+            try:
+                try:
+                    self.tk.call('tk_getOpenFile', '-foobarbaz')
+                except tk.TclError:
+                    pass
+                self.tk.call('set', '::tk::dialog::file::showHiddenBtn', '1')
+                self.tk.call('set', '::tk::dialog::file::showHiddenVar', '1')
+            except tk.TclError as e:
+                print(f"[dialog] Could not enable hidden folders in file dialogs: {e}")
         self.geometry("1440x900")
         self.configure(bg=BG_MAIN)
 
@@ -625,7 +656,182 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             if bitmask & 1:
                 drives.append(f"{letter}:")
             bitmask >>= 1
+        if IS_WINE:
+            # Under Wine, Z: is the whole Linux filesystem (incl. /proc): globbing it is slow and
+            # misses hidden folders like .local anyway, so Linux locations are searched explicitly.
+            drives = [d for d in drives
+                      if not (os.path.isdir(d + "\\proc") and os.path.isdir(d + "\\etc"))]
         return drives
+
+    def _ask_directory(self, title):
+        """Folder picker. Under Wine, Tk's own dialog is used instead of Wine's Windows dialog, which
+        hides dot-folders such as ~/.local or ~/.wine where Linux games and prefixes live."""
+        if IS_WINE:
+            try:
+                # Load the dialog code first; sourcing it later would reset the hidden-files settings
+                self.tk.call('auto_load', '::tk::dialog::file::')
+                self.tk.call('auto_load', '::tk::dialog::file::chooseDir::')
+                self.tk.call('set', '::tk::dialog::file::showHiddenBtn', '1')
+                self.tk.call('set', '::tk::dialog::file::showHiddenVar', '1')
+                chosen = self.tk.call('::tk::dialog::file::chooseDir::', '-title', title, '-parent', str(self),
+                                      '-initialdir', self._unix_home() or '', '-mustexist', '1')
+                return str(chosen) if chosen else ''
+            except tk.TclError as e:
+                print(f"[dialog] Tk folder dialog failed, using the native one: {e}")
+        return filedialog.askdirectory(title=title)
+
+    def _unix_home(self):
+        """The Linux home folder: ~ when running natively, or its Wine drive path (Z:\\home\\<user>) when the Windows build runs under Wine/Proton. None if unknown."""
+        if not IS_WINE:
+            return os.path.expanduser('~')
+        # Wine sets WINEHOMEDIR to the NT path of the Unix home, e.g. \??\Z:\home\user
+        wine_home = os.environ.get('WINEHOMEDIR', '').replace('\\??\\', '', 1)
+        user = os.environ.get('USER') or os.environ.get('USERNAME') or ''
+        for cand in (wine_home, f"Z:\\home\\{user}", f"Z:\\var\\home\\{user}"):
+            if cand and os.path.isdir(cand):
+                return cand
+        return None
+
+    def _host_path(self, path):
+        """Makes a path that the user typed or a Linux config file names usable here. Under Wine, Unix
+        paths (/home/... or ~/...) are mapped onto the Z: drive; otherwise only ~ is expanded."""
+        path = (path or '').strip()
+        if IS_WINE:
+            home = self._unix_home()
+            if path.startswith('~') and home:
+                path = home + path[1:]
+            elif path.startswith('/'):
+                path = 'Z:' + path
+            return os.path.normpath(path.replace('/', '\\'))
+        return os.path.expanduser(path)
+
+    def _linux_steam_libraries(self):
+        """Linux (natively, or the Windows build under Wine): every Steam library folder (the folder that contains steamapps/) of native, Flatpak and Snap Steam, including extra libraries listed in libraryfolders.vdf (e.g. on a second drive)."""
+        home = self._unix_home()
+        if not home:
+            return []
+        steam_roots = [
+            os.path.join(home, '.steam', 'steam'),
+            os.path.join(home, '.local', 'share', 'Steam'),
+            os.path.join(home, '.var', 'app', 'com.valvesoftware.Steam', '.local', 'share', 'Steam'),
+            os.path.join(home, '.var', 'app', 'com.valvesoftware.Steam', 'data', 'Steam'),
+            os.path.join(home, 'snap', 'steam', 'common', '.local', 'share', 'Steam'),
+            self._host_path('/usr/share/steam'),
+        ]
+        libraries = []
+        for sr in steam_roots:
+            if not os.path.isdir(os.path.join(sr, 'steamapps')):
+                continue
+            libraries.append(sr)
+            try:
+                with open(os.path.join(sr, 'steamapps', 'libraryfolders.vdf'), encoding='utf-8', errors='ignore') as f:
+                    for lib in re.findall(r'"path"\s+"([^"]+)"', f.read()):
+                        libraries.append(self._host_path(lib.replace('\\\\', '\\')))
+            except OSError:
+                pass
+        # The same library is often reachable via several symlinked roots
+        unique = {}
+        for lib in libraries:
+            if os.path.isdir(lib):
+                unique.setdefault(os.path.realpath(lib), lib)
+        return list(unique.values())
+
+    def _linux_wine_prefixes(self):
+        """Linux: Wine/Proton prefixes (folders containing drive_c) from Steam/Proton, Lutris, Heroic, Bottles, Faugus, PortProton and ~/.wine. Cached for the session."""
+        cached = getattr(self, '_wine_prefixes_cache', None)
+        if cached is not None:
+            return cached
+        home = self._unix_home()
+        if not home:
+            self._wine_prefixes_cache = []
+            return []
+        prefixes = [os.path.join(home, '.wine')]
+
+        for lib in self._linux_steam_libraries():
+            compat = os.path.join(lib, 'steamapps', 'compatdata')
+            try:
+                prefixes += [os.path.join(compat, appid, 'pfx') for appid in os.listdir(compat)]
+            except OSError:
+                pass
+
+        # Lutris and Heroic record each game's prefix in their config files
+        for cfg_dir, pattern in [
+            (os.path.join(home, '.config', 'lutris', 'games'), r'^\s*prefix:\s*[\'"]?(.+?)[\'"]?\s*$'),
+            (os.path.join(home, '.local', 'share', 'lutris', 'games'), r'^\s*prefix:\s*[\'"]?(.+?)[\'"]?\s*$'),
+            (os.path.join(home, '.config', 'heroic', 'GamesConfig'), r'"winePrefix"\s*:\s*"([^"]+)"'),
+            (os.path.join(home, '.var', 'app', 'com.heroicgameslauncher.hgl', 'config', 'heroic', 'GamesConfig'), r'"winePrefix"\s*:\s*"([^"]+)"'),
+        ]:
+            try:
+                for name in os.listdir(cfg_dir):
+                    with open(os.path.join(cfg_dir, name), encoding='utf-8', errors='ignore') as f:
+                        for p in re.findall(pattern, f.read(), re.MULTILINE):
+                            prefixes.append(self._host_path(p))
+            except OSError:
+                pass
+
+        # Default prefix locations of other launchers: look a few levels deep for drive_c
+        for parent in [
+            os.path.join(home, 'Games'),  # Lutris (~/Games/<game>) and Heroic (~/Games/Heroic/Prefixes/...)
+            os.path.join(home, '.local', 'share', 'bottles', 'bottles'),
+            os.path.join(home, '.var', 'app', 'com.usebottles.bottles', 'data', 'bottles', 'bottles'),
+            os.path.join(home, 'Faugus'),
+            os.path.join(home, 'PortProton', 'data', 'prefixes'),
+        ]:
+            level = [parent]
+            for _ in range(3):
+                nxt = []
+                for d in level:
+                    try:
+                        for e in os.scandir(d):
+                            if e.is_dir(follow_symlinks=False):
+                                (prefixes if os.path.isdir(os.path.join(e.path, 'drive_c')) else nxt).append(e.path)
+                    except OSError:
+                        pass
+                level = nxt
+
+        unique = {}
+        for p in prefixes:
+            if os.path.isdir(os.path.join(p, 'drive_c')):
+                unique.setdefault(os.path.realpath(p), p)
+        self._wine_prefixes_cache = list(unique.values())
+        return self._wine_prefixes_cache
+
+    def _linux_prefix_documents(self):
+        """Linux: the prefix's Documents folder that contains "Anno 117 - Pax Romana", preferring the prefix the game itself is installed in. Returns None if there is none."""
+        prefixes = []
+        exe = (getattr(self, 'game_exe_path', '') or '').replace('\\', '/')
+        if '/drive_c/' in exe:
+            prefixes.append(exe.split('/drive_c/', 1)[0])
+        prefixes += self._linux_wine_prefixes()
+        for prefix in prefixes:
+            users = os.path.join(prefix, 'drive_c', 'users')
+            try:
+                names = sorted(os.listdir(users), key=lambda n: n != 'steamuser')
+            except OSError:
+                continue
+            for name in names:
+                docs = os.path.join(users, name, 'Documents')
+                if os.path.isdir(os.path.join(docs, 'Anno 117 - Pax Romana')):
+                    return docs
+        return None
+
+    @staticmethod
+    def _find_game_dirs_in_prefix(prefix, max_depth=5):
+        """Linux: yields "Anno 117 - Pax Romana" folders inside a prefix's drive_c, for installs outside the Ubisoft default (e.g. C:\\Games). Skips windows/ and users/ and never follows symlinks."""
+        stack = [(os.path.join(prefix, 'drive_c'), 0)]
+        while stack:
+            path, depth = stack.pop()
+            try:
+                entries = list(os.scandir(path))
+            except OSError:
+                continue
+            for e in entries:
+                if not e.is_dir(follow_symlinks=False):
+                    continue
+                if e.name == 'Anno 117 - Pax Romana':
+                    yield e.path
+                elif depth < max_depth and not (depth == 0 and e.name.lower() in ('windows', 'users')):
+                    stack.append((e.path, depth + 1))
 
     def find_anno_exe(self):
         """Searches the Windows registry (Ubisoft launcher and Steam) and common installation directories for Anno117.exe. Returns the full path if found, otherwise an empty string."""
@@ -669,25 +875,17 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             program_files = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
             possible_roots.append(os.path.join(program_files, "Ubisoft", "Ubisoft Game Launcher", "games", "Anno 117 - Pax Romana", "Anno 117"))
             possible_roots.append(os.path.join(program_files, "Steam", "steamapps", "common", "Anno 117 - Pax Romana", "Anno 117"))
-        else:
-            # Linux: Steam typical install locations + Proton compatdata for the Ubisoft launcher prefix
-            home = os.path.expanduser('~')
-            steam_roots = [
-                os.path.join(home, '.steam', 'steam'),
-                os.path.join(home, '.local', 'share', 'Steam'),
-                '/usr/share/steam',
-            ]
-            for sr in steam_roots:
-                possible_roots.append(os.path.join(sr, 'steamapps', 'common', 'Anno 117 - Pax Romana', 'Anno 117'))
-                # Proton: game installed inside the Ubisoft Game Launcher prefix
-                compat = os.path.join(sr, 'steamapps', 'compatdata')
-                if os.path.isdir(compat):
-                    try:
-                        for appid in os.listdir(compat):
-                            ubi = os.path.join(compat, appid, 'pfx', 'drive_c', 'Program Files (x86)', 'Ubisoft', 'Ubisoft Game Launcher', 'games', 'Anno 117 - Pax Romana')
-                            possible_roots.append(ubi)
-                    except OSError:
-                        pass
+        if not IS_WINDOWS or IS_WINE:
+            # Linux: the Steam version in any Steam library, and the Ubisoft version inside
+            # any Wine/Proton prefix (Steam non-Steam-game, Lutris, Heroic, Bottles, ~/.wine ...).
+            # Also run when this Windows build runs under Wine, usually in a different prefix
+            # than the game, where the registry and C: don't know about the game.
+            for lib in self._linux_steam_libraries():
+                possible_roots.append(os.path.join(lib, 'steamapps', 'common', 'Anno 117 - Pax Romana', 'Anno 117'))
+                possible_roots.append(os.path.join(lib, 'steamapps', 'common'))
+            for prefix in self._linux_wine_prefixes():
+                for pf in ('Program Files (x86)', 'Program Files'):
+                    possible_roots.append(os.path.join(prefix, 'drive_c', pf, 'Ubisoft', 'Ubisoft Game Launcher', 'games'))
 
         drives = self.get_drive_letters()
 
@@ -720,6 +918,14 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             found = _exe_under(root)
             if found:
                 return found
+
+        if not IS_WINDOWS or IS_WINE:
+            # Last resort: the game was installed to a custom folder inside a prefix
+            for prefix in self._linux_wine_prefixes():
+                for game_dir in self._find_game_dirs_in_prefix(prefix):
+                    found = _exe_under(game_dir)
+                    if found:
+                        return found
 
         return None
 
@@ -886,7 +1092,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                         return
         # Not found — prompt user
         self._imperial_alert(T(1999101473), T(1999101474))
-        chosen = filedialog.askdirectory(title=T(1999101475))
+        chosen = self._ask_directory(title=T(1999101475))
         if chosen:
             chosen = os.path.normpath(chosen)
             # Accept either "Anno 117 - Pax Romana" or its "mods" subfolder
@@ -904,7 +1110,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
 
         if not self.game_exe_path:
             self._imperial_alert(T(1999101187), T(1999101220))
-            manual_root = filedialog.askdirectory(title="Select Anno 117 Installation Directory")
+            manual_root = self._ask_directory(title="Select Anno 117 Installation Directory")
             if manual_root:
                 if not self.set_game_path_from_root(os.path.normpath(manual_root)):
                     self.game_exe_path = ""
@@ -1010,7 +1216,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
 
                 mod_id = clean_line.replace("#", "").replace("not installed", "").strip()
                 if mod_id and " " not in mod_id:
-                    mod_status_map[mod_id] = {
+                    mod_status_map[_norm_mod_id(mod_id)] = {
                         "active": is_active,
                         "uninstalled": is_uninstalled
                     }
@@ -1088,7 +1294,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                 if not isinstance(data, dict):
                     return
 
-                m_id = data.get("ModID")
+                m_id = _norm_mod_id(data.get("ModID") or "")
                 if not m_id: return
 
                 # Map app language keys → modinfo.json language keys
@@ -1166,11 +1372,11 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                     "setup": data.get("GameSetup", {}) if isinstance(data.get("GameSetup"), dict) else {},
                     "diff": data.get("Difficulty", "Normal"),
                     "deps": {
-                        "Require": data.get("Dependencies", {}).get("Require", []) if isinstance(data.get("Dependencies"), dict) else [],
-                        "Optional": data.get("Dependencies", {}).get("Optional", []) if isinstance(data.get("Dependencies"), dict) else [],
-                        "LoadAfter": data.get("Dependencies", {}).get("LoadAfter", []) if isinstance(data.get("Dependencies"), dict) else [],
-                        "Deprecate": data.get("Dependencies", {}).get("Deprecate", []) if isinstance(data.get("Dependencies"), dict) else [],
-                        "Incompatible": data.get("Dependencies", {}).get("Incompatible", []) if isinstance(data.get("Dependencies"), dict) else []
+                        "Require": [_norm_mod_id(d) for d in deps.get("Require", []) if isinstance(d, str)],
+                        "Optional": [_norm_mod_id(d) for d in deps.get("Optional", []) if isinstance(d, str)],
+                        "LoadAfter": [_norm_mod_id(d) for d in deps.get("LoadAfter", []) if isinstance(d, str)],
+                        "Deprecate": [_norm_mod_id(d) for d in deps.get("Deprecate", []) if isinstance(d, str)],
+                        "Incompatible": [_norm_mod_id(d) for d in deps.get("Incompatible", []) if isinstance(d, str)]
                     }
                 }
                 mod_list.append(mod_entry)
@@ -1356,14 +1562,14 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                     mod_id = stripped.lstrip('#').strip()
                     # Only treat as a mod ID if it looks like one (no spaces, reasonable length)
                     if mod_id and ' ' not in mod_id and len(mod_id) < 100:
-                        preset_disabled.add(mod_id)
+                        preset_disabled.add(_norm_mod_id(mod_id))
                     else:
                         header_lines.append(line)
                 else:
                     # Capture the active mods!
                     mod_id = stripped.split('#')[0].strip() # Strip inline comments if any
                     if mod_id and ' ' not in mod_id and len(mod_id) < 100:
-                        preset_active.add(mod_id)
+                        preset_active.add(_norm_mod_id(mod_id))
 
         # Build a complete profile covering every installed top-level mod
         all_mods = self.get_all_mod_metadata()
@@ -1494,7 +1700,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                     if self._is_display_name_line(clean):
                         continue
                     mod_id = clean.split("#")[0].strip()
-                    if mod_id and " " not in mod_id and mod_id not in installed_ids:
+                    if mod_id and " " not in mod_id and _norm_mod_id(mod_id) not in installed_ids:
                         missing.append(mod_id)
         except Exception as e:
             print(f"Failed to check preset for missing mods: {e}")
@@ -1627,7 +1833,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                             content = self._read_text_file_robust(info_path)
                             content = self.strip_jsonc_comments(content)
                             info_data = json.loads(content)
-                            new_mod_id = info_data.get("ModID")
+                            new_mod_id = _norm_mod_id(info_data.get("ModID") or "") or None
                         except:
                             pass
                         break
@@ -1709,7 +1915,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                     info_path = os.path.join(final_destination, info_file)
                     if os.path.exists(info_path):
                         try:
-                            mod_id = json.loads(self.strip_jsonc_comments(self._read_text_file_robust(info_path))).get("ModID")
+                            mod_id = _norm_mod_id(json.loads(self.strip_jsonc_comments(self._read_text_file_robust(info_path))).get("ModID") or "") or None
                         except Exception:
                             pass
                         break
@@ -1803,6 +2009,9 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         self.right_panel = tk.Frame(self, bg=BG_SECTION, width=INFO_WIDTH, borderwidth=0, highlightthickness=0)
         self.right_panel.grid(row=0, column=2, sticky="nsew", padx=(5, 5), pady=5)
         self.right_panel.grid_propagate(False)
+        # Children are packed, so pack propagation must be off too - otherwise long
+        # texts (e.g. German button labels) widen the panel per selected mod.
+        self.right_panel.pack_propagate(False)
 
         self.lbl_right_title = tk.Label(self.right_panel, text=T(1999101009), font=FONT_HEADER, bg=BG_SECTION, fg=FG_MAIN)
         self.lbl_right_title.pack(pady=10)
@@ -2731,8 +2940,11 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             if mod['parent_path'] is None:
                 installed_count += 1
 
-                # Calculate size once per top-level folder
-                m_size = get_dir_size(mod['path'])
+                # Calculate size once per top-level folder; cached until the list is rebuilt
+                size_cache = self.__dict__.setdefault('_dir_size_cache', {})
+                if mod['path'] not in size_cache:
+                    size_cache[mod['path']] = get_dir_size(mod['path'])
+                m_size = size_cache[mod['path']]
                 total_size_bytes += m_size
 
                 # Determine if Active
@@ -2901,15 +3113,16 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         search_entry = tk.Entry(search_bg, textvariable=search_var, font=FONT_SMALL, bg=BG_MAIN, fg=FG_MAIN, insertbackground=FG_MAIN, width=18, relief="flat")
         search_entry.pack(side="left")
 
-        btn_x = tk.Button(search_bg, text="×", font=FONT_XSMALL, bg=BG_MAIN, fg=FG_DIM, relief="flat", cursor="hand2", command=lambda: self.render_activation_tab(search_query=""))
+        btn_x = tk.Button(search_bg, text="×", font=FONT_XSMALL, bg=BG_MAIN, fg=FG_DIM, relief="flat", cursor="hand2", command=lambda: search_var.set(""))
         btn_x.pack(side="left")
         self._bind_hover(btn_x, BG_MAIN, BG_HOVER)
         self._attach_tooltip(btn_x, T(1999101250))
 
         def _on_search_type(*args):
-            val = search_var.get()
-            if len(val) >= 3 or val == "":
-                self.render_activation_tab(search_query=val)
+            self.current_search_query = search_var.get()
+            if getattr(self, '_search_job', None):
+                self.after_cancel(self._search_job)
+            self._search_job = self.after(150, self._apply_activation_search)
         search_var.trace_add("write", _on_search_type)
 
         _ico_all = load_icon("activate_all", (22, 22))
@@ -2919,8 +3132,8 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         self._bind_hover(btn_activate_all, "#2e7d32", "#36943a")
         self._attach_tooltip(btn_activate_all, T(1999101251))
 
-        search_entry.bind("<Return>", lambda e: self.render_activation_tab(search_query=search_var.get()))
-        search_entry.bind("<Escape>", lambda e: self.render_activation_tab(search_query=""))
+        search_entry.bind("<Return>", lambda e: self._apply_activation_search())
+        search_entry.bind("<Escape>", lambda e: search_var.set(""))
 
 
         _ico_folder  = load_icon("open_folder", (24, 24))
@@ -2934,7 +3147,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         self._attach_tooltip(btn_open_folder, T(1999101252))
 
         # Refresh mod list button
-        btn_refresh = tk.Button(search_row, text="" if _ico_refresh else "↻", font=FONT_XSMALL, bg=BG_MAIN, fg=FG_MAIN, cursor="hand2", relief="raised", padx=8, image=_ico_refresh, compound="center" if _ico_refresh else "none", command=lambda: self.render_activation_tab( search_query=self.current_search_query))
+        btn_refresh = tk.Button(search_row, text="" if _ico_refresh else "↻", font=FONT_XSMALL, bg=BG_MAIN, fg=FG_MAIN, cursor="hand2", relief="raised", padx=8, image=_ico_refresh, compound="center" if _ico_refresh else "none", command=lambda: [setattr(self, '_dir_size_cache', {}), self.render_activation_tab(search_query=self.current_search_query)])
         if _ico_refresh: btn_refresh.image = _ico_refresh
         btn_refresh.pack(side="right", padx=2)
         self._bind_hover(btn_refresh, BG_MAIN)
@@ -2966,7 +3179,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         def get_sorting_key(m):
             m_id = m['id']
             # A. Activation Group (0 for the top group, 1 for the bottom)
-            _status = statuses.get(m_id)
+            _status = self.mod_statuses.get(m_id)
             if _status is not None:
                 is_active = bool(_status.get("active", False))
             else:
@@ -3063,6 +3276,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         scrollbar.pack(side="right", fill="y")
 
         # 4. Draw Mods
+        self._act_list = None
         if self.show_load_order:
             # One row per mod AND sub-mod, numbered 1..N in the exact order the loader loads them.
             # The loader sorts sub-mods individually, so they appear on their own with a note
@@ -3113,8 +3327,10 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         else:
             active_sep_needed = True
             inactive_sep_needed = True
+            # Widgets per mod row (with its sub-mod rows), so a toggled mod can move without a rebuild
+            self._act_list = {'mods': all_top_mods, 'key': get_sorting_key, 'groups': {}, 'seps': {}, 'pack': {}}
 
-            for mod in filtered_mods:
+            for mod in sorted(all_top_mods, key=get_sorting_key):
                 m_id = mod['id']
                 _status = statuses.get(m_id)
                 if _status is not None:
@@ -3124,15 +3340,20 @@ class AnnoModManagerApp(TkinterDnD.Tk):
 
                 if is_active == self.sort_active_first and active_sep_needed:
                     label = T(1999101439) if self.sort_active_first else T(1999101438)
-                    self._draw_separator(label)
+                    self._act_list['seps'][is_active] = self._draw_separator(label)
                     active_sep_needed = False
 
                 if is_active != self.sort_active_first and inactive_sep_needed:
                     label = T(1999101438) if self.sort_active_first else T(1999101439)
-                    self._draw_separator(label)
+                    self._act_list['seps'][is_active] = self._draw_separator(label)
                     inactive_sep_needed = False
 
+                n_before = len(self.scrollable_frame.pack_slaves())
                 self._draw_mod_row(self.scrollable_frame, mod, self.mods, statuses, is_active, indent=0, select_id=select_id)
+                self._act_list['groups'][m_id] = self.scrollable_frame.pack_slaves()[n_before:]
+
+            if query:
+                self._repack_activation_list()
 
         # --- Mousewheel logic ---
         def _on_mousewheel(event):
@@ -3157,6 +3378,113 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             tk.Frame(sep_container, bg=line_color, height=2).pack(fill="x", padx=10, side="left", expand=True)
             tk.Label(sep_container, text=f" {text} ", font=FONT_BOLD_SMALL, bg=BG_MAIN, fg=FG_DIM).pack(side="left", padx=10)
             tk.Frame(sep_container, bg=line_color, height=2).pack(fill="x", padx=10, side="left", expand=True)
+            return sep_container
+
+    def _apply_activation_search(self):
+        """Applies the search box to the activation list: re-packs drawn rows, or rebuilds in Load Order view."""
+        self._search_job = None
+        if getattr(self, 'current_tab', None) != "Mod Activation":
+            return
+        if getattr(self, '_act_list', None):
+            self._repack_activation_list()
+        else:
+            self.render_activation_tab(search_query=self.current_search_query)
+
+    def _repack_activation_list(self, moved_id=None):
+        """Re-packs the drawn activation rows in sort order, hiding mods that don't match the search.
+        After a toggle (moved_id) the visible rows stay where they are on screen; after a search the list returns to the top."""
+        data = getattr(self, '_act_list', None)
+        frame = getattr(self, 'scrollable_frame', None)
+        if not data or not frame or not frame.winfo_exists():
+            return
+        if moved_id is not None and moved_id not in data['groups']:
+            return
+
+        def _is_active(m_id):
+            _status = self.mod_statuses.get(m_id)
+            if _status is not None:
+                return bool(_status.get("active", False))
+            return self.enable_new_mods_var.get() in ("on", "keep")
+
+        anchor, offset = None, 0
+        if moved_id is not None:
+            # Anchor on the first visible widget that is not moving
+            self.canvas.update_idletasks()
+            moved = {str(w) for w in data['groups'][moved_id]}
+            view_top = self.canvas.yview()[0] * max(frame.winfo_height(), 1)
+            for w in frame.pack_slaves():
+                if str(w) not in moved and w.winfo_y() + w.winfo_height() > view_top:
+                    anchor, offset = w, w.winfo_y() - view_top
+                    break
+
+        query = self.current_search_query.lower().strip()
+        order = []
+        section = None
+        for m in sorted(data['mods'], key=data['key']):
+            if query and not (query in str(m.get('name', '')).lower() or query in str(m.get('category', '')).lower()):
+                continue
+            active = _is_active(m['id'])
+            if active != section:
+                sep = data['seps'].get(active)
+                if sep is None or not sep.winfo_exists():
+                    sep = data['seps'][active] = self._draw_separator(T(1999101439) if active else T(1999101438))
+                order.append(sep)
+                section = active
+            order.extend(data['groups'][m['id']])
+
+        for w in frame.pack_slaves():
+            if str(w) not in data['pack']:
+                info = w.pack_info()
+                info.pop('in', None)
+                data['pack'][str(w)] = info
+
+        # Touch only the rows that change, with window redraw held until the list is final
+        self._hold_redraw(self.canvas, True)
+        try:
+            wanted = {str(w) for w in order}
+            for w in frame.pack_slaves():
+                if str(w) not in wanted:
+                    w.pack_forget()
+            cur = [str(w) for w in frame.pack_slaves()]
+            for i, w in enumerate(order):
+                if i < len(cur) and cur[i] == str(w):
+                    continue
+                opts = dict(data['pack'][str(w)])
+                if i > 0:
+                    opts['after'] = order[i - 1]
+                elif cur:
+                    opts['before'] = frame.nametowidget(cur[0])
+                w.pack(**opts)
+                if str(w) in cur:
+                    cur.remove(str(w))
+                cur.insert(i, str(w))
+            # Arrow-key navigation (tk_focusNext) walks children in stacking order, which is
+            # creation order; restack so it follows the order on screen again.
+            for w in order:
+                w.lift()
+
+            frame.update_idletasks()
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            if anchor is not None:
+                self.canvas.yview_moveto(max(0, anchor.winfo_y() - offset) / max(frame.winfo_height(), 1))
+            elif moved_id is None:
+                self.canvas.yview_moveto(0)
+            self.canvas.update_idletasks()
+        finally:
+            self._hold_redraw(self.canvas, False)
+
+    def _hold_redraw(self, widget, hold):
+        """Windows only: suspends painting of a widget and its children (WM_SETREDRAW), repainting it once on release."""
+        if not IS_WINDOWS:
+            return
+        try:
+            hwnd = widget.winfo_id()
+            ctypes.windll.user32.SendMessageW(hwnd, 0x000B, 0 if hold else 1, 0)
+            if not hold:
+                # RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME
+                ctypes.windll.user32.RedrawWindow(hwnd, None, None, 0x0001 | 0x0004 | 0x0080 | 0x0100 | 0x0400)
+        except Exception:
+            pass
 
     def _draw_mod_row(self, parent_widget, current_mod, all_mods, statuses, is_active, indent=0, select_id=None, load_order_pos=None, load_order_positions=None, flat=False, parent_note=None):
         """Renders a single mod entry row inside the activation tab list: checkbox or indent marker, category badge, status/warning icons (conflict, missing dep, deprecated, tweaks) and the mod name coloured by state. Binds hover, click and keyboard navigation."""
@@ -3260,9 +3588,14 @@ class AnnoModManagerApp(TkinterDnD.Tk):
 
                 self.toggle_mod_status(current_mod['id'], var.get())
                 self.parse_active_profile()
-                # Dynamically update the top bar without refreshing the whole list
+                # Update the top bar and move the row to its group without rebuilding the list.
+                # The Load Order view has no movable groups (activating changes the order), so it rebuilds.
                 self.update_stats_label()
-                self.render_activation_tab()
+                if getattr(self, '_act_list', None):
+                    self._repack_activation_list(moved_id=current_mod['id'])
+                else:
+                    self.render_activation_tab(select_id=current_mod['id'])
+                    return
                 if getattr(self, 'selected_row_frame', None) == row:
                     self.update_right_panel(current_mod)
 
@@ -3538,7 +3871,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                     if not clean:
                         updated_lines.append(line)
                         continue
-                    current_id = clean.lstrip('#').split('#')[0].strip()
+                    current_id = _norm_mod_id(clean.lstrip('#').split('#')[0].strip())
 
                     if current_id == mod_id:
                         updated_lines.append(f"{mod_id} # not installed\n")
@@ -3928,6 +4261,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         if not os.path.exists(self.active_profile_path):
             return
 
+        mod_id = _norm_mod_id(mod_id)
         updated_lines = []
         found = False
         with open(self.active_profile_path, 'r', encoding='utf-8') as f:
@@ -3936,11 +4270,12 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         for line in lines:
             clean = line.strip()
             parts = clean.split()
-            if not clean or clean.startswith("##"):
+            id_part = clean.lstrip('#').split('#')[0].split()
+            if not clean or clean.startswith("##") or not id_part:
                 updated_lines.append(line)
                 continue
 
-            current_id = clean.lstrip('#').split('#')[0].strip().split()[0]
+            current_id = _norm_mod_id(id_part[0])
 
             if current_id == mod_id:
                 found = True
@@ -4297,7 +4632,24 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         e_frame = tk.Frame(path_frame, bg=BG_MAIN)
         e_frame.pack(fill="x", pady=5)
 
-        tk.Entry(e_frame, textvariable=self.game_path_var, font=FONT_SMALL, bg=BG_SECTION, fg=FG_MAIN, relief="flat").pack(side="left", fill="x", expand=True, ipady=4)
+        game_path_entry = tk.Entry(e_frame, textvariable=self.game_path_var, font=FONT_SMALL, bg=BG_SECTION, fg=FG_MAIN, relief="flat")
+        game_path_entry.pack(side="left", fill="x", expand=True, ipady=4)
+        # A typed/pasted path is applied on Enter or when leaving the field (the folder
+        # picker can be awkward on Linux, where prefixes sit in hidden folders).
+        _applied_game_path = [self.game_path_var.get()]
+        def _apply_typed_game_path(event=None):
+            typed = self.game_path_var.get().strip()
+            if not typed or typed == _applied_game_path[0]:
+                return
+            _applied_game_path[0] = typed
+            typed = os.path.normpath(self._host_path(typed))
+            if typed.lower().endswith(".exe"):
+                typed = os.path.dirname(os.path.dirname(os.path.dirname(typed)))
+            if self.set_game_path_from_root(typed):
+                _applied_game_path[0] = self.game_path_var.get()
+                self.update_mod_path_from_mode()
+        game_path_entry.bind("<Return>", _apply_typed_game_path)
+        game_path_entry.bind("<FocusOut>", _apply_typed_game_path)
         browse_btn = tk.Button(e_frame, text=T(1999101053), font=FONT_SMALL, bg=BG_SECTION, fg=FG_MAIN, cursor="hand2", command=self.browse_game_path)
         browse_btn.pack(side="right", padx=(10, 0))
         self._bind_hover(browse_btn, BG_SECTION, BG_HOVER)
@@ -4309,12 +4661,12 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         _dov_row = tk.Frame(path_frame, bg=BG_MAIN)
         _dov_row.pack(fill="x", pady=4)
         _docs_var = tk.StringVar(value=getattr(self, "custom_docs_path", ""))
-        tk.Entry(_dov_row, textvariable=_docs_var, font=FONT_SMALL, bg=BG_SECTION, fg=FG_MAIN, relief="flat").pack(side="left", fill="x", expand=True, ipady=4)
-        def _browse_docs():
-            ch = filedialog.askdirectory(title=T(1999101475))
+        docs_entry = tk.Entry(_dov_row, textvariable=_docs_var, font=FONT_SMALL, bg=BG_SECTION, fg=FG_MAIN, relief="flat")
+        docs_entry.pack(side="left", fill="x", expand=True, ipady=4)
+        def _apply_docs_path(ch):
             if ch:
                 # Accept either the "Anno 117 - Pax Romana" folder or its "mods" subfolder
-                ch = os.path.normpath(ch)
+                ch = os.path.normpath(self._host_path(ch))
                 if os.path.basename(ch).lower() == "mods":
                     ch = os.path.dirname(ch)  # step up to "Anno 117 - Pax Romana"
                 self.custom_docs_path = ch
@@ -4330,6 +4682,22 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                         if "Documents" in str(cfg.get("value", [""])):
                             w.config(text=T(1999101371, new_docs_display))
                             break
+        def _browse_docs():
+            _apply_docs_path(self._ask_directory(title=T(1999101475)))
+        def _apply_typed_docs(event=None):
+            typed = _docs_var.get().strip()
+            if not typed:
+                if getattr(self, "custom_docs_path", ""):
+                    _clear_docs()
+                return
+            if os.path.normpath(self._host_path(typed)) == os.path.normpath(getattr(self, "custom_docs_path", "") or "."):
+                return
+            if os.path.isdir(self._host_path(typed)):
+                _apply_docs_path(typed)
+            else:
+                self._imperial_alert(T(1999101284), T(1999101395, typed), is_error=True)
+        docs_entry.bind("<Return>", _apply_typed_docs)
+        docs_entry.bind("<FocusOut>", _apply_typed_docs)
         def _clear_docs():
             self.custom_docs_path = ""
             _docs_var.set("")
@@ -4347,7 +4715,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         if getattr(self, 'custom_docs_path', ''):
             docs_raw = os.path.join(self.custom_docs_path, "mods")
         else:
-            user_docs = os.path.expanduser("~/Documents")
+            user_docs = self._default_docs_dir()
             docs_raw = os.path.join(user_docs, "Anno 117 - Pax Romana", "mods")
         docs_display = os.path.normpath(docs_raw)
 
@@ -4475,30 +4843,30 @@ class AnnoModManagerApp(TkinterDnD.Tk):
 
     def browse_game_path(self):
         """Opens a directory picker and passes the chosen path to set_game_path_from_root."""
-        path = filedialog.askdirectory(title="Select Anno 117 Installation Directory")
+        path = self._ask_directory(title="Select Anno 117 Installation Directory")
         if path:
             normalized_path = os.path.normpath(path)
             self.set_game_path_from_root(normalized_path)
+
+    def _default_docs_dir(self):
+        """The Documents folder that holds "Anno 117 - Pax Romana" when no custom folder is set."""
+        win_docs = os.path.expanduser("~/Documents")
+        if IS_WINDOWS and not IS_WINE:
+            return win_docs
+        if IS_WINE and os.path.isdir(os.path.join(win_docs, "Anno 117 - Pax Romana")):
+            # The app shares the game's Wine prefix
+            return win_docs
+        # On Linux the game runs under Proton/Wine, so its Documents folder lives inside
+        # a prefix (users/steamuser under Proton, users/<name> under plain Wine).
+        home = self._unix_home()
+        return self._linux_prefix_documents() or (win_docs if IS_WINE or not home else os.path.join(home, "Documents"))
 
     def update_mod_path_from_mode(self):
         """Recalculates mod_path and the active-profile/log/options file paths. Respects a custom Anno 117 documents folder if the user has configured one."""
         if getattr(self, 'custom_docs_path', ''):
             docs_base = os.path.normpath(os.path.join(self.custom_docs_path, "mods"))
         else:
-            if IS_WINDOWS:
-                user_docs = os.path.expanduser("~/Documents")
-            else:
-                # On Linux the game runs under Proton; try the Proton documents path first
-                home = os.path.expanduser("~")
-                proton_docs = None
-                _compat_root = os.path.join(home, ".steam", "steam", "steamapps", "compatdata")
-                if os.path.isdir(_compat_root):
-                    for _appid in os.listdir(_compat_root):
-                        _candidate = os.path.join(_compat_root, _appid, "pfx", "drive_c", "users", "steamuser", "Documents")
-                        if os.path.isdir(os.path.join(_candidate, "Anno 117 - Pax Romana")):
-                            proton_docs = _candidate
-                            break
-                user_docs = proton_docs or os.path.join(home, "Documents")
+            user_docs = self._default_docs_dir()
             docs_base = os.path.normpath(os.path.join(user_docs, "Anno 117 - Pax Romana", "mods"))
 
         # Newer game versions store profiles as mods/profiles/<name>.txt, with the
@@ -6984,7 +7352,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         if os.path.exists(path):
             try:
                 with open(path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    return {_norm_mod_id(k): v for k, v in json.load(f).items()}
             except Exception as e:
                 print(f"Failed to load subscription map: {e}")
         return {}
@@ -7363,7 +7731,7 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                 if not clean:
                     updated_lines.append(line)
                     continue
-                current_id = clean.lstrip('#').split('#')[0].strip()
+                current_id = _norm_mod_id(clean.lstrip('#').split('#')[0].strip())
 
                 if current_id == mod_id:
                     updated_lines.append(f"{mod_id} # not installed\n")
@@ -7711,8 +8079,14 @@ class AnnoModManagerApp(TkinterDnD.Tk):
         self._bind_hover(btn_reset, "#8b0000", "#AF0202")
         self._attach_tooltip(btn_reset, T(1999101270))
 
-        lbl_name = tk.Label(header_frame, text=mod['name'], font=FONT_HEADER, bg=BG_SECTION, fg=FG_MAIN, wraplength=320, justify="left", anchor="nw")
+        lbl_name = tk.Label(header_frame, text=mod['name'], font=FONT_HEADER, bg=BG_SECTION, fg=FG_MAIN, wraplength=280, justify="left", anchor="nw")
         lbl_name.pack(side="left", fill="x", expand=True)
+        # Wrap the name in whatever space the (language-dependent) reset button leaves.
+        def _fit_name_wrap(event, lbl=lbl_name, btn=btn_reset):
+            wrap = max(120, event.width - btn.winfo_reqwidth() - 20)
+            if lbl.cget("wraplength") != wrap:
+                lbl.config(wraplength=wrap)
+        header_frame.bind("<Configure>", _fit_name_wrap)
 
         tk.Frame(self.right_panel, height=1, bg=FG_DIM).pack(fill="x", padx=15, pady=5)
 
@@ -7789,8 +8163,22 @@ class AnnoModManagerApp(TkinterDnD.Tk):
             group_frame.pack(fill="x", padx=20, pady=7)
 
             group_label_text = str(group_details.get('label', group_key))
-            group_header = tk.Label(
-                group_frame,
+            group_header = tk.Frame(group_frame, bg=BG_SECTION, cursor="hand2")
+            group_header.pack(fill="x")
+
+            raw_collapsed = group_details.get('collapsed', False)
+            collapsed = (
+                raw_collapsed if isinstance(raw_collapsed, bool)
+                else str(raw_collapsed).strip().lower() == 'true'
+            )
+            group_state = {'collapsed': collapsed}
+
+            # Accordion indicator: same arrow icons as the mod list's sort headers.
+            # Down = collapsed (click to expand), up = expanded (click to collapse).
+            group_arrow = tk.Label(group_header, bg=BG_SECTION, fg=FG_MAIN, font=FONT_BODY, cursor="hand2")
+            group_arrow.pack(side="right", padx=(5, 15))
+            group_title = tk.Label(
+                group_header,
                 text=group_label_text,
                 font=FONT_BODY,
                 bg=BG_SECTION,
@@ -7801,32 +8189,36 @@ class AnnoModManagerApp(TkinterDnD.Tk):
                 padx=15,
                 pady=10,
             )
-            group_header.pack(fill="x")
+            group_title.pack(side="left", fill="x", expand=True)
+
+            def set_group_arrow(arrow=group_arrow, state=group_state):
+                ico = load_icon("arrow_down" if state['collapsed'] else "arrow_up", (18, 18))
+                if ico:
+                    arrow.config(image=ico, text="")
+                    arrow.image = ico
+                else:
+                    arrow.config(image="", text="▼" if state['collapsed'] else "▲")
+            set_group_arrow()
 
             group_body = tk.Frame(group_frame, bg=BG_SECTION)
-            raw_collapsed = group_details.get('collapsed', False)
-            collapsed = (
-                raw_collapsed if isinstance(raw_collapsed, bool)
-                else str(raw_collapsed).strip().lower() == 'true'
-            )
-            group_state = {'collapsed': collapsed}
-
             if not collapsed:
                 group_body.pack(fill="x", padx=5, pady=(0, 5))
 
-            def toggle_group(event=None, body=group_body, state=group_state):
+            def toggle_group(event=None, body=group_body, state=group_state, update_arrow=set_group_arrow):
                 state['collapsed'] = not state['collapsed']
                 if state['collapsed']:
                     body.pack_forget()
                 else:
                     body.pack(fill="x", padx=5, pady=(0, 5))
+                update_arrow()
                 def refresh_group_scrollregion():
                     container.update_idletasks()
                     canvas.configure(scrollregion=canvas.bbox("all"))
                 canvas.after_idle(refresh_group_scrollregion)
                 return "break"
 
-            group_header.bind("<Button-1>", toggle_group)
+            for w in (group_header, group_title, group_arrow):
+                w.bind("<Button-1>", toggle_group)
             group_hosts[group_key] = group_body
 
         for opt_key, opt_details in options_schema.items():
